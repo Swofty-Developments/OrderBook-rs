@@ -385,6 +385,11 @@ where
     ///   pricelevel < 0.9 restore a demoted order at its old
     ///   `(timestamp, seq)` position — re-snapshot to pin the corrected
     ///   order.
+    /// - [`OrderUpdate::UpdateQuantity`] with a **zero** total quantity
+    ///   cancels the order: it is removed from the book, tracked as
+    ///   `Cancelled { UserRequested }`, and its id becomes reusable.
+    ///   A zero-quantity maker can never fill, so resting one only
+    ///   published a price level with no depth.
     /// - [`OrderUpdate::UpdatePrice`], [`OrderUpdate::UpdatePriceAndQuantity`],
     ///   and [`OrderUpdate::Replace`] are implemented as cancel-then-add:
     ///   the order always re-enters at the back of its (possibly new)
@@ -584,6 +589,23 @@ where
                 order_id,
                 new_quantity,
             } => {
+                // A zero total is a removal, not a resize. pricelevel keeps a
+                // zero-quantity maker in its queue (`new_total <= live_total`
+                // ⇒ keep in place), so applying the update rested a maker at
+                // zero depth: it held `best_bid` / `best_ask` on a level with
+                // nothing to fill, made `will_cross_market` reject a post-only
+                // at that price, and was eventually dropped by a sweep with no
+                // trade and no cancel event, leaking its `order_locations`
+                // entry (`cancel_order` then returned `Ok(None)` while a
+                // re-add of the id reported `DuplicateOrderId`). Cancel it
+                // instead — the same removal `OrderUpdate::Cancel` performs,
+                // and the one `Replace` / `UpdatePriceAndQuantity` already
+                // reach with a zero quantity. Ungated: `update_order` holds
+                // the shared submit gate (#209).
+                if new_quantity.as_u64() == 0 {
+                    return self.cancel_order_with_reason(order_id, CancelReason::UserRequested);
+                }
+
                 // Get order location without locking
                 let location = self.order_locations.get(&order_id).map(|val| *val);
 
