@@ -663,21 +663,39 @@ where
 
     /// Applies a single sequencer event to the given book.
     ///
-    /// Events with `Rejected` results are skipped — they represent commands
-    /// that failed at write time and must not be re-applied during replay.
+    /// A submit — `AddOrder`, `MarketOrder`, `MarketOrderByAmount` — is
+    /// always re-executed, because it can execute real trades and *then*
+    /// return `Err`: an IOC whose remainder is unfillable, a taker STP
+    /// cancels after non-self fills, and a market order that only cancels
+    /// same-user makers under `CancelMaker` all report failure over a
+    /// mutated book. A sequencer records those as `Rejected`, so skipping
+    /// them resurrected liquidity the live book had consumed. Replay
+    /// re-executes matching deterministically, so those fills are
+    /// reproduced by the re-execution itself — see
+    /// [`Self::reconcile_submit`] for which of its errors are tolerated.
+    ///
+    /// Every other command is failure-atomic (the modify paths validate
+    /// before touching the book, cancels are no-ops on a missing order), so
+    /// a `Rejected` result still skips it.
     fn apply_event(book: &OrderBook<T>, event: &SequencerEvent<T>) -> Result<(), ReplayError> {
-        // Skip events whose original execution was rejected.
-        if matches!(event.result, SequencerResult::Rejected { .. }) {
+        let rejected_live = matches!(event.result, SequencerResult::Rejected { .. });
+        let is_submit = matches!(
+            event.command,
+            SequencerCommand::AddOrder(_)
+                | SequencerCommand::MarketOrder { .. }
+                | SequencerCommand::MarketOrderByAmount { .. }
+        );
+        if rejected_live && !is_submit {
             return Ok(());
         }
 
         match &event.command {
             SequencerCommand::AddOrder(order) => {
-                book.add_order(order.clone())
-                    .map_err(|e| ReplayError::OrderBookError {
-                        sequence_num: event.sequence_num,
-                        source: e,
-                    })?;
+                Self::reconcile_submit(
+                    event,
+                    rejected_live,
+                    book.add_order(order.clone()).map(|_| ()),
+                )?;
             }
             SequencerCommand::CancelOrder(id) => {
                 book.cancel_order(*id)
@@ -694,18 +712,19 @@ where
                     })?;
             }
             SequencerCommand::MarketOrder { id, quantity, side } => {
-                book.submit_market_order(*id, *quantity, *side)
-                    .map_err(|e| ReplayError::OrderBookError {
-                        sequence_num: event.sequence_num,
-                        source: e,
-                    })?;
+                Self::reconcile_submit(
+                    event,
+                    rejected_live,
+                    book.submit_market_order(*id, *quantity, *side).map(|_| ()),
+                )?;
             }
             SequencerCommand::MarketOrderByAmount { id, amount, side } => {
-                book.submit_market_order_by_amount(*id, *amount, *side)
-                    .map_err(|e| ReplayError::OrderBookError {
-                        sequence_num: event.sequence_num,
-                        source: e,
-                    })?;
+                Self::reconcile_submit(
+                    event,
+                    rejected_live,
+                    book.submit_market_order_by_amount(*id, *amount, *side)
+                        .map(|_| ()),
+                )?;
             }
             SequencerCommand::CancelAll => {
                 let _ = book.cancel_all_orders();
@@ -732,6 +751,40 @@ where
         }
 
         Ok(())
+    }
+
+    /// Reconciles a re-executed submit's outcome against the journaled one.
+    ///
+    /// Tolerated:
+    /// - any error when the live execution failed too (`rejected_live`) —
+    ///   replay reached the same verdict, and whatever the live command
+    ///   mutated before failing this one mutated as well;
+    /// - `InsufficientLiquidity` / `InsufficientLiquidityNotional` /
+    ///   `SelfTradePrevented` regardless of the journaled result: these are
+    ///   the errors a submit returns *after* real fills, so a sequencer that
+    ///   records the fills rather than the rejection is journaling the truth
+    ///   and replay must not abort on them.
+    ///
+    /// Every other error means replay diverged from the recorded execution
+    /// and is surfaced as [`ReplayError::OrderBookError`].
+    fn reconcile_submit(
+        event: &SequencerEvent<T>,
+        rejected_live: bool,
+        outcome: Result<(), OrderBookError>,
+    ) -> Result<(), ReplayError> {
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(_) if rejected_live => Ok(()),
+            Err(
+                OrderBookError::InsufficientLiquidity { .. }
+                | OrderBookError::InsufficientLiquidityNotional { .. }
+                | OrderBookError::SelfTradePrevented { .. },
+            ) => Ok(()),
+            Err(source) => Err(ReplayError::OrderBookError {
+                sequence_num: event.sequence_num,
+                source,
+            }),
+        }
     }
 }
 
