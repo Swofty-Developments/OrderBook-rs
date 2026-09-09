@@ -607,6 +607,16 @@ where
                                 stop.consume(executed, price);
                             }
                         }
+                        // Reachability: the same-user maker is only reached
+                        // if the taker still has quantity left after the
+                        // non-self depth in front of it. A taker the
+                        // pre-match already satisfied never self-trades, so
+                        // this is an ordinary complete fill — the rule
+                        // `check_modify_stp_self_cross` already applies when
+                        // it dry-runs this same decision (#168).
+                        if stop.is_done() {
+                            break;
+                        }
                         stp_taker_cancelled = true;
                         break;
                     }
@@ -683,6 +693,12 @@ where
                                 );
                                 stop.consume(executed, price);
                             }
+                        }
+                        // Same reachability rule as `CancelTaker` above, and
+                        // here it also gates the maker cancellation: a maker
+                        // the taker never reached must survive untouched.
+                        if stop.is_done() {
+                            break;
                         }
                         // Cancel the maker on the held level for the same lockstep
                         // event + state + risk effects as CancelMaker (#95); level

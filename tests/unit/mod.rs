@@ -40,6 +40,7 @@ mod sequencer_types_tests;
 mod snapshot_restore_tests;
 #[cfg(feature = "special_orders")]
 mod special_order_restore_tests;
+mod stp_reachability_tests;
 mod two_tranche_conservation_tests;
 mod update_price_and_quantity_two_tranche_tests;
 mod validation_tests;
