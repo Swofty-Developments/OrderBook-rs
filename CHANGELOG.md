@@ -459,6 +459,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` is unchanged. Single-thread and
   contention measurements are reported in the pull request.
 
+- **`OrderUpdate::UpdateQuantity` with a zero quantity cancels the order
+  (#223).** A zero `new_quantity` was accepted and applied as a resize:
+  pricelevel keeps a non-growing total in place, so the maker rested at
+  zero depth, holding `best_bid` / `best_ask` on a level with nothing
+  behind it (a post-only at that price was refused against liquidity that
+  did not exist) until a sweep dropped it with no trade and no cancel
+  event, leaking its `order_locations` entry — `cancel_order` then
+  returned `Ok(None)` while re-adding the id reported `DuplicateOrderId`,
+  and the tracked status stayed `Open` forever. The arm now routes to the
+  same `UserRequested` cancel that `OrderUpdate::Cancel` performs, so the
+  level-change event, the `Cancelled { UserRequested }` transition, the
+  per-account risk release, the location / user-index untrack and the
+  empty-level removal happen in lockstep. **Contract:** zero is a removal,
+  not a resize. It cancels the *entire* order, hidden depth of an iceberg
+  or reserve order included (a nonzero `new_quantity` still resizes only
+  the visible tranche), and it bypasses the projected-order validator and
+  the modify-aware risk check, so a configured `min_order_size` no longer
+  rejects it with `OrderSizeOutOfRange`. The kill switch still refuses it,
+  as it refuses every modify. Pinned for plain, iceberg and reserve makers,
+  a `min_order_size` book, a shared level, an absent id and an engaged
+  kill switch.
+
 - **Reserve `UpdatePriceAndQuantity` honours the requested visible quantity
   (#221).** `OrderQuantity::set_quantity` read a `ReserveOrder`'s argument
   as a **total** target and only ever reduced: a requested increase was

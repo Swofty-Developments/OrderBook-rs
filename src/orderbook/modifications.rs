@@ -385,11 +385,15 @@ where
     ///   pricelevel < 0.9 restore a demoted order at its old
     ///   `(timestamp, seq)` position — re-snapshot to pin the corrected
     ///   order.
-    /// - [`OrderUpdate::UpdateQuantity`] with a **zero** total quantity
-    ///   cancels the order: it is removed from the book, tracked as
-    ///   `Cancelled { UserRequested }`, and its id becomes reusable.
-    ///   A zero-quantity maker can never fill, so resting one only
-    ///   published a price level with no depth.
+    /// - [`OrderUpdate::UpdateQuantity`] with a **zero** `new_quantity`
+    ///   cancels the entire order, including the hidden quantity of an
+    ///   iceberg or reserve order. It is removed from the book, tracked as
+    ///   `Cancelled { UserRequested }`, and its id becomes reusable. This
+    ///   applies even when hidden liquidity remains: for a two-tranche
+    ///   order `new_quantity` normally resizes only the visible tranche,
+    ///   but zero is a removal, not a resize, so it is never applied to a
+    ///   tranche. A zero-quantity maker can never fill, so resting one
+    ///   only published a price level with no depth.
     /// - [`OrderUpdate::UpdatePrice`], [`OrderUpdate::UpdatePriceAndQuantity`],
     ///   and [`OrderUpdate::Replace`] are implemented as cancel-then-add:
     ///   the order always re-enters at the back of its (possibly new)
@@ -406,21 +410,29 @@ where
     /// [`OrderUpdate::Cancel`]. Cancels are explicitly allowed so that
     /// operators can drain resting orders while new flow is halted.
     ///
-    /// [`OrderUpdate::UpdateQuantity`] is validate-first (#211): the
-    /// projected post-update order must pass the shared shape validator
-    /// (tick / lot / min-max / two-tranche representability) and the
-    /// modify-aware risk check, and any upstream
+    /// A **nonzero** [`OrderUpdate::UpdateQuantity`] is validate-first
+    /// (#211): the projected post-update order must pass the shared shape
+    /// validator (tick / lot / min-max / two-tranche representability)
+    /// and the modify-aware risk check, and any upstream
     /// [`PriceLevelError`](pricelevel::PriceLevelError) from applying the
     /// update is propagated as [`OrderBookError::PriceLevelError`] — a
     /// rejected update leaves the maker unchanged, and `Ok(None)` means
     /// only that the requested order is absent.
     ///
     /// Because the shared validator runs on the projected order, two
-    /// previously-accepted shapes are now rejected on `UpdateQuantity`
-    /// like they already were on the #98 modify paths: an
-    /// expired-but-unevicted GTD / DAY maker (`InvalidOperation`, expiry
-    /// is evaluated against the book clock) and a resting post-only maker
-    /// whose price meanwhile crosses the market (`PriceCrossing`).
+    /// previously-accepted shapes are now rejected on a nonzero
+    /// `UpdateQuantity` like they already were on the #98 modify paths:
+    /// an expired-but-unevicted GTD / DAY maker (`InvalidOperation`,
+    /// expiry is evaluated against the book clock) and a resting
+    /// post-only maker whose price meanwhile crosses the market
+    /// (`PriceCrossing`).
+    ///
+    /// A **zero** `UpdateQuantity` is a removal and runs none of that:
+    /// it bypasses the projected shape validator and the modify-aware
+    /// risk check entirely, so neither a configured `min_order_size` nor
+    /// a risk limit vetoes it, and takes the same cancel path as
+    /// [`OrderUpdate::Cancel`]. Only the kill-switch check above still
+    /// applies to it, because it is submitted as a modify.
     ///
     /// The three cancel-then-add variants additionally run two pre-checks
     /// on the projected order, both **before** the original is cancelled so
@@ -598,10 +610,17 @@ where
                 // trade and no cancel event, leaking its `order_locations`
                 // entry (`cancel_order` then returned `Ok(None)` while a
                 // re-add of the id reported `DuplicateOrderId`). Cancel it
-                // instead — the same removal `OrderUpdate::Cancel` performs,
-                // and the one `Replace` / `UpdatePriceAndQuantity` already
-                // reach with a zero quantity. Ungated: `update_order` holds
-                // the shared submit gate (#209).
+                // instead — the same removal `OrderUpdate::Cancel` performs.
+                // `Replace` / `UpdatePriceAndQuantity` with a zero quantity
+                // also end with the original gone, but only after their
+                // validate-first checks pass; this branch runs no validator
+                // at all (a removal has no shape to validate), so a
+                // configured `min_order_size` cannot veto it and the raw
+                // `new_quantity` is read here rather than a projected
+                // total: for an iceberg / reserve order that field is the
+                // visible tranche, and zero cancels the whole order, hidden
+                // depth included. Ungated: `update_order` holds the submit
+                // gate (#209 / #225).
                 if new_quantity.as_u64() == 0 {
                     return self.cancel_order_with_reason(order_id, CancelReason::UserRequested);
                 }
