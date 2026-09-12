@@ -93,7 +93,13 @@ pub enum OrderBookError {
 
     /// Order quantity is not a multiple of the configured lot size
     InvalidLotSize {
-        /// The order quantity that failed validation
+        /// The quantity that failed validation: the order quantity, a single
+        /// tranche of a two-tranche order (iceberg / reserve), or the capped
+        /// quantity a reserve's replenishment would transfer into its visible
+        /// tranche. The transfer case can report a value the caller never
+        /// submitted — with `replenish_amount` unset and automatic
+        /// replenishment on it is `pricelevel`'s
+        /// `DEFAULT_RESERVE_REPLENISH_AMOUNT` capped by the hidden tranche.
         quantity: u64,
         /// The configured lot size
         lot_size: u64,

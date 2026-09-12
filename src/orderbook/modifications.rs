@@ -6,7 +6,10 @@ use crate::orderbook::order_state::{CancelReason, OrderStatus};
 use crate::orderbook::reject_reason::RejectReason;
 use crate::orderbook::trade::TradeResult;
 use either::Either;
-use pricelevel::{Id, OrderType, OrderUpdate, PriceLevel, Quantity, Side, TakerKind};
+use pricelevel::{
+    DEFAULT_RESERVE_REPLENISH_AMOUNT, Id, OrderType, OrderUpdate, PriceLevel, Quantity, Side,
+    TakerKind,
+};
 use std::sync::Arc;
 use tracing::trace;
 
@@ -213,18 +216,59 @@ fn reduce_reserve_to_total<T>(order: &mut OrderType<T>, new_total_quantity: u64)
         *visible_quantity = Quantity::new(vis.saturating_sub(filled_from_visible));
 
         let remaining_to_reduce = amount_to_reduce - filled_from_visible;
+        // Hidden may only ever DECREASE here: the #226 lot-size admission
+        // check validates the replenishment transfer once, against the
+        // hidden tranche as submitted, and `min(amount, hidden)` stays
+        // lot-aligned only while hidden never grows.
         *hidden_quantity =
             Quantity::new(hidden_quantity.as_u64().saturating_sub(remaining_to_reduce));
 
         if visible_quantity.as_u64() == 0 && hidden_quantity.as_u64() > 0 {
+            // The refresh runs regardless of `auto_replenish`: this helper
+            // only ever sees an aggressive taker's residual, and it refreshes
+            // it from `replenish_amount` alone. That diverges from
+            // pricelevel's contract for a RESTING maker, where a depleted
+            // visible tranche without `auto_replenish` removes the order from
+            // the level instead of refreshing it. Reconciling the two is
+            // tracked in #230. Because this helper performs the transfer, the
+            // #226 lot rule validates `min(replenish_amount, hidden)` at
+            // admission whatever `auto_replenish` says.
             let refresh = replenish_amount
                 .map(|q| q.get())
                 .unwrap_or(0)
                 .min(hidden_quantity.as_u64());
             *visible_quantity = Quantity::new(refresh);
+            // Decrease only, for the same reason as above.
             *hidden_quantity = Quantity::new(hidden_quantity.as_u64().saturating_sub(refresh));
         }
     }
+}
+
+/// Accept `quantity` only when it is a whole multiple of the book's `lot`
+/// size, in quantity units.
+///
+/// Every lot-size branch of `validate_order_shape` funnels through here so
+/// the rejection carries the offending quantity — the tranche or the
+/// replenishment transfer that failed — rather than the order total (#226).
+///
+/// # Errors
+/// [`OrderBookError::InvalidLotSize`] carrying `quantity` and `lot`.
+#[inline]
+#[must_use = "lot-size validation errors must be handled"]
+fn check_lot_multiple(quantity: u64, lot: u64) -> Result<(), OrderBookError> {
+    if quantity.is_multiple_of(lot) {
+        Ok(())
+    } else {
+        Err(invalid_lot_size(quantity, lot))
+    }
+}
+
+/// Build the [`OrderBookError::InvalidLotSize`] rejection out of line.
+#[cold]
+#[inline(never)]
+#[must_use]
+fn invalid_lot_size(quantity: u64, lot_size: u64) -> OrderBookError {
+    OrderBookError::InvalidLotSize { quantity, lot_size }
 }
 
 impl<T> OrderBook<T>
@@ -993,11 +1037,69 @@ where
     /// Checks, in order:
     /// 1. STP `MissingUserId` (when STP is enabled and `user_id` is zero).
     /// 2. Tick size (`InvalidTickSize`).
-    /// 3. Lot size (`InvalidLotSize`, iceberg visible/hidden split).
+    /// 3. Lot size (`InvalidLotSize`, per order kind — see below).
     /// 4. Min/max order size (`OrderSizeOutOfRange`).
     /// 5. Expiry (`InvalidOperation` — already expired).
     /// 6. Post-only would cross (`PriceCrossing`).
     /// 7. FOK feasibility (`InsufficientLiquidity`).
+    ///
+    /// # Lot size
+    ///
+    /// When the book carries a lot size, every quantity the engine can make
+    /// *visible on a level* must be a whole multiple of it. The check is
+    /// matched exhaustively over [`OrderType`], per kind (#226):
+    ///
+    /// - `Standard`, `PostOnly`, `TrailingStop`, `PeggedOrder` and
+    ///   `MarketToLimit` carry a single quantity — that quantity is checked.
+    /// - `IcebergOrder` is checked per tranche: `visible_quantity` and
+    ///   `hidden_quantity` individually, because the hidden tranche becomes
+    ///   the visible one as the order refills.
+    /// - `ReserveOrder` is checked per tranche exactly like an iceberg and,
+    ///   in addition, on the **capped transfer** that replenishment will move
+    ///   from hidden into the visible tranche. That transfer is a quantity
+    ///   the book will display, so it must be lot-aligned too. It is checked
+    ///   only while `hidden_quantity > 0` (with no hidden tranche nothing is
+    ///   ever transferred):
+    ///   - `replenish_amount == Some(a)`: `min(a, hidden)` is checked
+    ///     *regardless* of `auto_replenish`, because the residual-resting
+    ///     helper behind [`OrderQuantity::set_total_remaining`] refreshes an
+    ///     emptied visible tranche with `replenish_amount.min(hidden)`
+    ///     without consulting `auto_replenish`.
+    ///   - `replenish_amount == None` with `auto_replenish == true`:
+    ///     `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, hidden)` is checked — that
+    ///     is the amount `pricelevel`'s `match_against` transfers when the
+    ///     visible tranche is depleted or falls below the threshold.
+    ///   - `replenish_amount == None` with `auto_replenish == false`: no
+    ///     transfer check — `pricelevel` never replenishes and the residual
+    ///     helper refreshes zero.
+    ///
+    /// `replenish_threshold` is unrestricted: it is only ever *compared*
+    /// against the visible tranche, never transferred, so a non-aligned
+    /// threshold cannot produce a non-aligned quantity.
+    ///
+    /// Validating the transfer **once, at admission** is sound because
+    /// `hidden_quantity` is monotone non-increasing for an admitted order:
+    /// fills, [`reduce_reserve_to_total`] and `pricelevel`'s
+    /// `new_hidden = hidden − replenish_qty` only ever shrink it, and the
+    /// quantity-rewriting paths (`with_reduced_quantity`,
+    /// [`OrderQuantity::set_quantity`], `OrderUpdate::Replace`) touch the
+    /// *visible* tranche only. A cap that holds at admission therefore keeps
+    /// holding: `min(amount, hidden)` can only move further down toward
+    /// `hidden`, which was itself validated as lot-aligned.
+    ///
+    /// One intended consequence: on a lot size that does not divide
+    /// [`DEFAULT_RESERVE_REPLENISH_AMOUNT`] (100, 25, 30, 60, 3, …) a reserve
+    /// order that relies on the default amount — `replenish_amount == None`
+    /// with `auto_replenish == true` — is inadmissible whenever it carries
+    /// hidden depth: hidden is at least one lot, so the capped transfer is
+    /// exactly the default (80) and the order is rejected with
+    /// `InvalidLotSize { quantity: 80, .. }`. Such books must set an explicit
+    /// lot-aligned `replenish_amount`.
+    ///
+    /// Iceberg and Reserve therefore share identical visible / hidden
+    /// validation, while Reserve additionally validates its applicable
+    /// replenishment — so the two kinds can still reach different verdicts
+    /// for the same `(visible, hidden)` pair.
     ///
     /// # Errors
     /// Returns the first failing check's typed [`OrderBookError`].
@@ -1035,36 +1137,66 @@ where
             });
         }
 
-        // Lot size validation: reject orders whose quantity is not a multiple of lot_size.
-        // For iceberg orders, validate visible and hidden quantities individually.
+        // Lot size validation: reject orders carrying a quantity the book
+        // could display that is not a multiple of lot_size. Matched
+        // exhaustively per kind (see the `# Lot size` section above) so a
+        // future `OrderType` variant must choose its own rule instead of
+        // silently inheriting the single-quantity check (#226).
         if let Some(lot) = self.lot_size
             && lot > 0
         {
             match order {
+                OrderType::Standard { quantity, .. }
+                | OrderType::PostOnly { quantity, .. }
+                | OrderType::TrailingStop { quantity, .. }
+                | OrderType::PeggedOrder { quantity, .. }
+                | OrderType::MarketToLimit { quantity, .. } => {
+                    check_lot_multiple(quantity.as_u64(), lot)?;
+                }
                 OrderType::IcebergOrder {
                     visible_quantity,
                     hidden_quantity,
                     ..
                 } => {
-                    if visible_quantity.as_u64() % lot != 0 {
-                        return Err(OrderBookError::InvalidLotSize {
-                            quantity: visible_quantity.as_u64(),
-                            lot_size: lot,
-                        });
-                    }
-                    if hidden_quantity.as_u64() % lot != 0 {
-                        return Err(OrderBookError::InvalidLotSize {
-                            quantity: hidden_quantity.as_u64(),
-                            lot_size: lot,
-                        });
-                    }
+                    check_lot_multiple(visible_quantity.as_u64(), lot)?;
+                    check_lot_multiple(hidden_quantity.as_u64(), lot)?;
                 }
-                _ => {
-                    if order.total_quantity() % lot != 0 {
-                        return Err(OrderBookError::InvalidLotSize {
-                            quantity: order.total_quantity(),
-                            lot_size: lot,
-                        });
+                OrderType::ReserveOrder {
+                    visible_quantity,
+                    hidden_quantity,
+                    replenish_amount,
+                    auto_replenish,
+                    ..
+                } => {
+                    // Per-tranche rule, identical to the iceberg one: both
+                    // tranches take their turn on a level.
+                    check_lot_multiple(visible_quantity.as_u64(), lot)?;
+                    let hidden = hidden_quantity.as_u64();
+                    check_lot_multiple(hidden, lot)?;
+
+                    // Reserve-only: the replenishment transfer is itself a
+                    // quantity the book will display, capped by whatever is
+                    // left hidden. With no hidden tranche nothing moves.
+                    if hidden > 0 {
+                        let transfer = match (replenish_amount, auto_replenish) {
+                            // The residual-resting helper refreshes with
+                            // `replenish_amount.min(hidden)` whatever
+                            // `auto_replenish` says, so an explicit amount is
+                            // always relevant.
+                            (Some(amount), _) => Some(amount.get().min(hidden)),
+                            // `pricelevel` falls back to its default amount
+                            // when replenishing automatically.
+                            (None, true) => {
+                                Some(DEFAULT_RESERVE_REPLENISH_AMOUNT.get().min(hidden))
+                            }
+                            // Nothing ever transfers: no default replenish
+                            // without `auto_replenish`, and the residual
+                            // helper refreshes zero without an amount.
+                            (None, false) => None,
+                        };
+                        if let Some(transfer) = transfer {
+                            check_lot_multiple(transfer, lot)?;
+                        }
                     }
                 }
             }

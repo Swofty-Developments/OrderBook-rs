@@ -985,8 +985,20 @@ where
     /// Create a new order book for the given symbol with lot size validation.
     ///
     /// Orders added to this book must have quantities that are exact multiples
-    /// of `lot_size`. For iceberg orders, both visible and hidden quantities
-    /// are validated individually.
+    /// of `lot_size`. For the two-tranche kinds (iceberg and reserve) both the
+    /// visible and the hidden quantity are validated individually, and a
+    /// reserve is additionally validated on the quantity its replenishment
+    /// would transfer into the visible tranche — see `validate_order_shape`
+    /// for the per-kind rules.
+    ///
+    /// On a lot size that does not divide `pricelevel`'s
+    /// [`DEFAULT_RESERVE_REPLENISH_AMOUNT`](pricelevel::DEFAULT_RESERVE_REPLENISH_AMOUNT)
+    /// of 80 quantity units (100, 25, 30, 60, 3, …), a reserve order that
+    /// leaves `replenish_amount` unset while `auto_replenish` is on is
+    /// rejected with `InvalidLotSize { quantity: 80, .. }` as soon as it
+    /// carries any hidden depth — the transfer it would perform is exactly
+    /// the default. Set an explicit lot-aligned `replenish_amount` on such a
+    /// book.
     ///
     /// # Arguments
     /// - `symbol`: The trading symbol for this order book
@@ -1190,8 +1202,29 @@ where
     /// Set the minimum quantity increment for orders.
     ///
     /// When set, order quantities must be exact multiples of this value.
-    /// For iceberg orders, both visible and hidden quantities are validated
-    /// individually. Rejection returns `OrderBookError::InvalidLotSize`.
+    /// For the two-tranche kinds (iceberg and reserve) both the visible and
+    /// the hidden quantity are validated individually, and a reserve is
+    /// additionally validated on the quantity its replenishment would
+    /// transfer into the visible tranche — see `validate_order_shape` for
+    /// the per-kind rules. Rejection returns
+    /// `OrderBookError::InvalidLotSize`.
+    ///
+    /// On a lot size that does not divide `pricelevel`'s
+    /// [`DEFAULT_RESERVE_REPLENISH_AMOUNT`](pricelevel::DEFAULT_RESERVE_REPLENISH_AMOUNT)
+    /// of 80 quantity units (100, 25, 30, 60, 3, …), a reserve order that
+    /// leaves `replenish_amount` unset while `auto_replenish` is on is
+    /// rejected with `InvalidLotSize { quantity: 80, .. }` as soon as it
+    /// carries any hidden depth — the transfer it would perform is exactly
+    /// the default. Set an explicit lot-aligned `replenish_amount` on such a
+    /// book.
+    ///
+    /// Changing the lot size on a book that already holds resting orders
+    /// does not re-validate existing levels — that is the caller's
+    /// responsibility. Orders admitted under the old lot size keep resting
+    /// as they are, and an order that would no longer pass admission is also
+    /// unmodifiable (every quantity-carrying update re-validates the
+    /// projected order), so it must be cancelled and re-submitted with
+    /// aligned tranches.
     ///
     /// # Arguments
     /// - `lot_size`: Minimum quantity increment. Must be > 0
