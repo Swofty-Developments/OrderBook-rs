@@ -115,6 +115,11 @@ path = "benches/order_book/stp_sweep_hdr.rs"
 harness = false
 
 [[bench]]
+name = "stp_contention_hdr"
+path = "benches/order_book/stp_contention_hdr.rs"
+harness = false
+
+[[bench]]
 name = "alloc_count"
 path = "benches/order_book/alloc_count.rs"
 harness = false

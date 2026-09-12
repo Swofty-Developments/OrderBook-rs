@@ -72,8 +72,9 @@ Per-run summaries land in `target/alloc-counters/<scenario>.md`.
 ## How to run
 
 ```bash
-make bench-hdr                 # all eight scenarios
+make bench-hdr                 # every _hdr bench binary, incl. stp_contention_hdr's 8 scenarios
 cargo bench --bench mixed_70_20_10_hdr   # single scenario
+cargo bench --bench stp_contention_hdr   # all 8 mode x thread-count scenarios in one binary
 ```
 
 Each bench writes its raw HDR histogram to
@@ -274,6 +275,19 @@ single worst-case observation dominates.
 aggressive self-crossing market buys from the taker, each one hitting
 the per-level STP scan + inline maker cancel (#107).
 
+**Liquidity profile (fixed for #225).** The other-maker depth is not a
+one-shot seed: before every measured op, the levels the sweep is
+currently walking (the current best ask and the next few above it) are
+topped back up to their seeded other-maker order count. Earlier
+versions of this bench seeded the 8-per-level other-maker depth once,
+up front, with no refill — foreign liquidity was gone within the first
+few hundred of the 100 000 measured ops, so almost the entire
+measured window was sweeping a book with nothing real left to fill
+against. The numbers directly below predate that fix; they are kept
+for the pricelevel-upgrade bisection narrative underneath, not as a
+representative baseline. See "#225 gate-mode comparison" below for the
+post-fix, sustained-liquidity numbers.
+
 | Quantile | Latency (ns) |
 |---|---|
 | p50    | 1 208 |
@@ -300,6 +314,82 @@ nothing measurable on top — and tightened this scenario's tail
 (p99.9 `14.3 µs → 5.5 µs`, p99.99 `26.3 µs → 9.5 µs` vs the
 pre-stack midpoint). Correctness bought with median latency on the
 STP self-cross path; every other scenario's median is unchanged.
+
+**#225 gate-mode comparison.** #225 makes STP-active submits (STP
+enabled, non-zero taker `user_id`) take the exclusive side of the
+`submit_gate` `RwLock` instead of the shared side, so the per-level STP
+scan and the fill it authorises see a consistent queue. `stp_sweep` is
+single-threaded and uncontended, so it isolates the fixed per-op cost
+of exclusive vs shared acquisition on this workload's own submits,
+independent of any cross-thread contention — see `stp_contention`
+below for the multi-threaded contention cost.
+
+| Quantile | `main` (shared gate) | #225 branch (exclusive gate) |
+|---|---|---|
+| p50    | 3 375 ns | 2 835 ns |
+| p99    | 6 667 ns | 5 127 ns |
+| p99.9  | 9 711 ns | 7 835 ns |
+| p99.99 | 19 759 ns | 15 919 ns |
+
+Medians of three runs per side on the same macOS host, no CPU pinning,
+`Cargo.lock` aligned, `main` at `f167327` with the same bench sources.
+Run-to-run spread on either side was about ±10 % at p50. No
+single-thread regression from the exclusive acquisition is visible; the
+branch runs came out faster, which we attribute to code layout and
+warm-up rather than to the lock mode and do not claim as an improvement.
+
+### `stp_contention` — N-thread contention on one book, gate-mode comparison (added for #225)
+
+`stp_contention_hdr` is the multi-threaded counterpart to `stp_sweep`:
+`N` threads (1 / 2 / 4 / 8) share ONE `OrderBook<()>`, each running
+50 000 closed-loop ops (own `Rng`, own histogram) released together on a
+`Barrier`. Op mix per thread: 70% passive limit adds a few ticks off a
+fixed mid (rest, never cross), 20% cancels of that thread's own resting
+orders, 10% aggressive limit orders that cross the whole passive band in
+one shot. Each thread owns one user id from an 8-id pool, so under
+`CancelMaker` a thread's own aggressive crossings routinely hit its own
+resting makers.
+
+Two configurations run back to back on the same book geometry:
+`STPMode::None` (baseline — every submit stays on the shared side of the
+`submit_gate` `RwLock`) and `STPMode::CancelMaker` (#225 — STP-active
+submits take the exclusive side instead). The `None` column is the
+STP-disabled baseline and must not move across the #225 change. The
+`None` versus `CancelMaker` gap measured on `main` is the intrinsic cost
+of the per-level STP scan and its inline same-user cancels, not the
+gate; the cost of the gate-mode change itself is isolated by comparing
+`main` and the #225 branch at the same thread count under `CancelMaker`,
+which is what the table below does. Reported per thread-count: the
+merged (all threads) p50 / p99 / p99.9 plus aggregate throughput
+(`ops/s`, wall clock from barrier release to last-thread-done).
+
+Like every scenario in this suite, this is **closed-loop, per-thread
+service time** — see "Coordinated omission" above; it under-reports the
+queueing delay a saturated real load generator would see, and it adds
+its own dimension (lock / structure contention across threads) that the
+single-threaded scenarios cannot show at all.
+
+| Threads | `None` p50 (main / #225) | `None` ops/s (main / #225) | `CancelMaker` p50 (main / #225) | `CancelMaker` ops/s (main / #225) |
+|---|---|---|---|---|
+| 1 | 958 / 917 ns | 378k / 389k | 750 / 791 ns | 899k / 902k |
+| 2 | 1 250 / 1 250 ns | 599k / 613k | 1 208 / 1 000 ns | 1 036k / 601k |
+| 4 | 1 583 / 1 625 ns | 873k / 879k | 1 459 / 6 251 ns | 1 105k / 271k |
+| 8 | 2 417 / 2 459 ns | 861k / 1 031k | 2 333 / 17 423 ns | 1 048k / 214k |
+
+Medians of three runs per side, same host and conditions as the
+`stp_sweep` comparison above, `main` at `f167327`. The `None` column is
+unchanged within noise, as required: an `STPMode::None` book never takes
+the exclusive side. The single-threaded `CancelMaker` row is unchanged
+too, so the uncontended exclusive acquisition has no measurable cost.
+From two threads up the `CancelMaker` column carries the cost of #225 by
+design: in this mix 80 % of the operations (identified passive adds and
+IOC takers) are STP-relevant and now serialize through the exclusive
+gate, so aggregate throughput drops by about 43 % at two threads, 74 %
+at four and 80 % at eight, with the merged p50 rising in step. The
+p99.9 / p99.99 columns of the merged histograms (in the `.hgrm` files)
+move by a similar factor. Restoring submit concurrency on STP books
+needs the per-level STP-aware match in pricelevel, tracked as a
+follow-up; the book-level gate is the correctness fix.
 
 ## 0.11.0 → 0.12.0 delta
 
@@ -332,9 +422,12 @@ the same host and session attributes the differences:
 - **Closed-loop only.** As called out under Methodology — these
   numbers are pure service time, not load-induced tail. Open-loop
   measurement is the next iteration of this suite.
-- **Single-threaded driver.** The benches issue one op at a time. A
-  multi-writer driver would surface `DashMap` shard contention more
-  visibly; deferred to a follow-up.
+- **Single-threaded driver, except `stp_contention`.** Every scenario but
+  `stp_contention` issues one op at a time from a single thread.
+  `stp_contention` (added for #225) is the first multi-writer scenario in
+  this suite — up to 8 threads sharing one book — but it only exercises
+  the STP gate-mode comparison, not the other seven workloads; a general
+  multi-writer driver for the rest is deferred to a follow-up.
 
 ## Reproducing
 

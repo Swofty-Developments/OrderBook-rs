@@ -45,12 +45,20 @@ pub struct PriceLevelChangedEvent {
 /// matched, or updated).
 /// Callback invoked with every price-level change event.
 ///
-/// # Re-entrancy contract (#209)
+/// # Re-entrancy contract (#209, #225)
 ///
-/// Fires while the book's submit gate is held. Like
+/// Fires while the book's submit gate is held — exclusively since #225
+/// for fill-or-kill submits and for self-trade-prevention relevant
+/// submits and matching-capable modifies. Like
 /// [`TradeListener`](crate::orderbook::trade::TradeListener), it must
 /// never call back into the same `OrderBook`'s mutating API on the
-/// invoking thread — hand the event off to a queue or channel instead.
+/// invoking thread: the gate is not reentrant, so the nested acquisition
+/// **may** deadlock — a nested shared acquisition of `std::sync::RwLock`
+/// is unspecified and may succeed, panic or block — and it **always**
+/// deadlocks when the gate is held exclusively. The prohibition is
+/// absolute: a listener that happens to work today on an `STPMode::None`
+/// book will hang the moment STP is enabled. Hand the event off to a queue
+/// or channel instead.
 pub type PriceLevelChangedListener = Arc<dyn Fn(PriceLevelChangedEvent) + Send + Sync>;
 
 #[cfg(test)]

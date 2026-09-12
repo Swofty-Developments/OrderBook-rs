@@ -255,10 +255,20 @@ mod tests_post_only_stp_precedence {
         for round in 0..ROUNDS {
             let mut book: OrderBook<()> = DefaultOrderBook::new("POSTP");
             book.set_stp_mode(STPMode::CancelMaker);
-            let trades: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+            // Capture every trade as (maker_id, taker_id, quantity) rather than
+            // a bare count: a CI failure here must be diagnosable from the log
+            // alone, without a local repro of the interleaving (#225).
+            let trades: Arc<Mutex<Vec<(Id, Id, u64)>>> = Arc::new(Mutex::new(Vec::new()));
             let sink = Arc::clone(&trades);
             book.trade_listener = Some(Arc::new(move |tr: &TradeResult| {
-                *sink.lock().expect("sink") += tr.match_result.trades().len() as u64;
+                let mut recorded = sink.lock().expect("sink");
+                for trade in tr.match_result.trades().as_vec() {
+                    recorded.push((
+                        trade.maker_order_id(),
+                        trade.taker_order_id(),
+                        trade.quantity().as_u64(),
+                    ));
+                }
             }));
             let book = Arc::new(book);
 
@@ -302,10 +312,21 @@ mod tests_post_only_stp_precedence {
             // Same-user post-only vs same-user ask: no interleaving may
             // produce a trade (post-only never takes; the ask taker is
             // self-trade-prevented against a resting post-only).
+            let recorded = trades.lock().expect("sink").clone();
+            let resting = match (book.get_order(ask_id), book.get_order(po_id)) {
+                (Some(_), Some(_)) => "both",
+                (Some(_), None) => "ask",
+                (None, Some(_)) => "post_only",
+                (None, None) => "neither",
+            };
             assert_eq!(
-                *trades.lock().expect("sink"),
+                recorded.len(),
                 0,
-                "round {round}: zero trades under every interleaving"
+                "round {round}: zero trades under every interleaving \
+                 (trades={recorded:?}, ask_id={ask_id}, po_id={po_id}, \
+                 ask_ok={}, po_ok={}, resting={resting})",
+                ask_outcome.is_ok(),
+                po_outcome.is_ok()
             );
 
             // Post-only precedence over STP: a rejected post-only is a

@@ -26,6 +26,53 @@ use serde::{Deserialize, Serialize};
 ///
 /// The default mode is [`STPMode::None`], which disables all STP checks and
 /// incurs zero overhead in the matching hot path.
+///
+/// # Concurrency (#225)
+///
+/// The engine decides the STP action for a price level by snapshotting its
+/// queue, and then acts on that decision in a second step. To keep the two
+/// steps consistent, every STP-relevant submit and every matching-capable
+/// modify (`UpdatePrice`, `UpdatePriceAndQuantity`, `Replace`) takes the
+/// **exclusive** side of the book's submit gate, so no concurrent
+/// admission, cancel or modify can land between the scan and the fill.
+///
+/// This serializes the book. Because an order carrying
+/// `user_id == Hash32::zero()` is rejected with `MissingUserId` while STP
+/// is enabled, every admissible `add_order` is identified, and every one of
+/// them that can take liquidity runs one at a time. Post-only submits are
+/// the exception on the submit path — they resolve before the STP scan is
+/// reached and never take liquidity, so they keep the shared side — along
+/// with `UpdateQuantity`, cancels and mass cancels.
+///
+/// Anonymous takers (`user_id == Hash32::zero()`) also stay on the shared
+/// path, because STP is skipped for them — but on an STP-enabled book that
+/// is reachable **only** through the match-only entry points
+/// (`OrderBook::match_order_with_user`,
+/// `OrderBook::match_market_order_with_user`,
+/// `OrderBook::match_market_order_by_amount_with_user`), never through
+/// `add_order`. Mixing anonymous flow into an STP book does not restore
+/// concurrency for the identified flow: an anonymous sweep still waits for
+/// any identified submit in progress, and which waiter proceeds first when
+/// the gate is released is platform-dependent.
+///
+/// The unit of exclusion is one call, not one batch. The repricing sweeps
+/// (`RepricingOperations::reprice_pegged_orders`,
+/// `reprice_trailing_stops`, `reprice_special_orders`, `special_orders`
+/// feature) drive the public `OrderBook::update_order` once per order, so
+/// under STP they take and release the exclusive gate N times. That is
+/// correct and deadlock-free — each re-price is individually atomic
+/// against concurrent flow — but the sweep as a whole is not: other
+/// submits interleave between consecutive re-prices, and a peg repriced
+/// early in the sweep can be filled before a later one is even evaluated.
+///
+/// The guarantee covers mutations performed through the `OrderBook` API.
+/// Mutation applied directly to the `Arc<PriceLevel>` handles returned by
+/// `OrderBook::get_bids` / `OrderBook::get_asks` bypasses the gate and is
+/// outside it (tracked in #228).
+///
+/// [`STPMode::None`] books are unaffected: with no STP scan there is no
+/// window to protect, and their submits keep the shared, fully concurrent
+/// path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum STPMode {

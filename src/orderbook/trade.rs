@@ -149,14 +149,20 @@ fn compute_quote_notional(match_result: &MatchResult) -> u128 {
 /// Trade listener specification using Arc for shared ownership
 /// Callback invoked with every emitted [`TradeResult`].
 ///
-/// # Re-entrancy contract (#209)
+/// # Re-entrancy contract (#209, #225)
 ///
 /// The listener may fire while the book's submit gate is held (the
-/// trade-emitting entry points hold it across the sweep — exclusively for
-/// a fill-or-kill submit). A listener must therefore **never call back
-/// into the same `OrderBook`'s mutating API** (add / submit / cancel /
-/// update / mass cancel / market sweeps) on the invoking thread: the gate
-/// is not reentrant and the nested acquisition can deadlock. Hand the
+/// trade-emitting entry points hold it across the sweep). Since #225 that
+/// hold is **exclusive** for a fill-or-kill submit and for every
+/// self-trade-prevention relevant submit or matching-capable modify. A
+/// listener must **never call back into the same `OrderBook`'s mutating
+/// API** (add / submit / cancel / update / mass cancel / market sweeps) on
+/// the invoking thread: the gate is not reentrant, so the nested
+/// acquisition **may** deadlock — a nested shared acquisition of
+/// `std::sync::RwLock` is unspecified and may succeed, panic or block —
+/// and it **always** deadlocks when the gate is held exclusively. The
+/// prohibition is absolute: a listener that happens to work today on an
+/// `STPMode::None` book will hang the moment STP is enabled. Hand the
 /// event off to a queue or channel instead and mutate from another
 /// context.
 pub type TradeListener = Arc<dyn Fn(&TradeResult) + Send + Sync>;

@@ -33,7 +33,14 @@ OrderBook-rs is a high-performance, lock-free order book implementation for fina
 - Single-threaded: ~1M orders/second
 - 30-thread HFT simulation: ~600K orders/second
 - Low latency: <1µs for order operations
-- Lock-free: No contention in concurrent scenarios
+- Lock-free data structures on the matching path: skiplist price levels,
+  concurrent maps and atomics; no lock is taken per price level
+
+Mutating entry points additionally pass a book-level gate that serializes
+the two decisions that must not interleave with another mutation:
+fill-or-kill feasibility and self-trade prevention. See
+[Concurrent Access](#4-concurrent-access) for what is serialized and what
+stays concurrent.
 
 ---
 
@@ -566,27 +573,39 @@ match book.add_limit_order(order_id, price, qty, Side::Buy, TimeInForce::Gtc, No
 
 ### 2. Trade Notifications
 
+A listener is installed on the book, not passed per call:
+
 ```rust
 use orderbook_rs::prelude::*;
+use std::sync::{Arc, mpsc};
 
-// Define trade listener
-let listener = |trade: &TradeResult| {
-    println!("Trade executed:");
-    println!("  Symbol: {}", trade.symbol);
-    for event in &trade.events {
-        println!("  Price: {}, Quantity: {}", event.price, event.quantity);
-    }
-};
+let (tx, rx) = mpsc::channel();
 
-// Execute order with listener
-book.add_market_order_with_listener(
-    OrderId::new(),
-    100,
-    Side::Buy,
-    None,
-    listener
-)?;
+let mut book = OrderBook::<()>::new("BTC/USD");
+book.set_trade_listener(Arc::new(move |trade: &TradeResult| {
+    // Do not touch the book from here; hand the event off and return.
+    let _ = tx.send((trade.engine_seq, trade.match_result.trades().len()));
+}));
+
+let book = Arc::new(book);
+book.submit_market_order(OrderId::new(), 100, Side::Buy)?;
+
+while let Ok((seq, fills)) = rx.try_recv() {
+    println!("engine_seq {seq}: {fills} fill(s)");
+}
 ```
+
+**Re-entrancy contract.** `TradeListener`, `PriceLevelChangedListener` and
+`OrderStateListener` all fire from inside the book operation that produced
+the event, and may fire while that operation still holds the book-level
+gate described in [Concurrent Access](#4-concurrent-access). A listener
+must therefore never call back into the same `OrderBook`'s mutating API on
+the invoking thread: `add_order` / `submit_*`, `cancel_order`,
+`update_order`, the mass cancels and the market sweeps all re-enter the
+gate, which is not reentrant, so the nested acquisition can deadlock. Push
+the event onto a channel or queue and mutate from another context.
+Read-only queries (`best_bid`, `best_ask`, snapshots, statistics) are not
+gated and are safe from a listener.
 
 ### 3. State Management
 
@@ -626,6 +645,57 @@ std::thread::spawn(move || {
     );
 });
 ```
+
+**What the book serializes.** The price-level map, the order index and the
+statistics counters are lock-free structures: skiplists, concurrent maps
+and atomics, with no per-level lock. On top of those, the mutating entry
+points pass a single book-level gate, which is taken in one of two modes:
+
+| Operation | Gate mode |
+|---|---|
+| Ordinary submit, cancel, `UpdateQuantity`, mass cancel | shared |
+| Fill-or-kill submit | exclusive |
+| Identified submit (any kind except post-only) or market sweep with STP enabled | exclusive |
+| Post-only submit, any STP mode (never runs the STP scan) | shared |
+| `UpdatePrice` / `UpdatePriceAndQuantity` / `Replace` with STP enabled | exclusive |
+
+The exclusive modes exist because both decisions are made in one step and
+applied in a second one: a fill-or-kill checks multi-level feasibility and
+then sweeps, and a self-trade-prevention submit scans a price level's queue
+and then fills it. Holding the gate exclusively across both steps is what
+stops another thread from admitting, cancelling or re-pricing an order in
+between and having the decision applied to a book state it was never taken
+on.
+
+Everything else stays on the shared side and runs concurrently. A book left
+on the default `STPMode::None` never takes the exclusive side except for
+fill-or-kill. Enabling STP therefore serializes every identified submit
+except post-only, and every matching-capable re-price, on that book.
+Post-only orders never take liquidity and never run the STP scan, so
+they keep the shared side; they are excluded from an identified taker's
+window by that taker's exclusive hold, not by their own. The shared path for an
+anonymous taker (`Hash32::zero()`, which skips the STP scan) is reachable
+only through the match-only entry points (`match_order_with_user`,
+`match_market_order_with_user`, `match_market_order_by_amount_with_user`):
+`add_order` rejects a zero `user_id` with `MissingUserId` whenever STP is
+enabled, so mixing anonymous and identified flow does not preserve submit
+concurrency on an STP book.
+
+**Scope.** The guarantee covers every mutation made through the
+`OrderBook` API: the submit, cancel, modify, mass-cancel and market-sweep
+entry points listed above, plus snapshot restores. One thing sits
+outside it, and one thing is worth spelling out:
+
+- `get_bids()` / `get_asks()` hand out `Arc<PriceLevel>` handles; mutating a
+  level through one of those handles bypasses the gate entirely (tracked in
+  issue #228). Use them for reading only.
+- Snapshot restores are covered: the live `restore_from_snapshot(&self)`
+  takes the exclusive side of the gate for its commit phase, and the
+  `&mut self` package / JSON restores are exclusive by construction.
+
+**Read-only queries are never gated**, so `best_bid`, `best_ask`,
+snapshots, statistics and the iterators can be called from any thread,
+including from inside a listener callback.
 
 ### 5. Custom Extra Data
 
@@ -847,6 +917,27 @@ let snapshot = book.create_snapshot(10);  // Only top 10 levels
 let snapshot = book.create_snapshot(0);  // All levels (high memory)
 ```
 
+**Issue: A thread hangs inside a listener callback**
+
+A listener that mutates the same book on the invoking thread re-enters the
+book-level gate, which is not reentrant, so the thread can block forever.
+
+```rust
+// Wrong: the cancel re-enters the gate the submit may still hold.
+book.set_trade_listener(Arc::new(move |trade: &TradeResult| {
+    let _ = book_handle.cancel_order(some_id);
+}));
+
+// Correct: hand the event off and mutate from another context.
+book.set_trade_listener(Arc::new(move |trade: &TradeResult| {
+    let _ = tx.send(trade.engine_seq);
+}));
+```
+
+This applies to `TradeListener`, `PriceLevelChangedListener` and
+`OrderStateListener` alike. See
+[Trade Notifications](#2-trade-notifications) for the full contract.
+
 ### Debug Tips
 
 ```rust
@@ -882,7 +973,11 @@ Based on Apple M4 Max processor:
 **Multi-threaded (30 threads):**
 - Total throughput: ~600K orders/sec
 - Per-thread: ~20K orders/sec
-- Zero contention (lock-free)
+- No per-price-level locking; concurrency across threads depends on the
+  gate mode of the ops being issued (see
+  [Concurrent Access](#4-concurrent-access)). These figures do not
+  characterise a book running with self-trade prevention engaged: for the
+  STP gate-mode comparison see `BENCH.md`.
 
 **Metrics calculation:**
 - VWAP: ~2µs (10 levels)

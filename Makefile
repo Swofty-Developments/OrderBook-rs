@@ -177,6 +177,7 @@ bench-hdr:
 	cargo bench --bench thin_book_sweep_hdr
 	cargo bench --bench mass_cancel_burst_hdr
 	cargo bench --bench stp_sweep_hdr
+	cargo bench --bench stp_contention_hdr
 
 
 .PHONY: workflow-coverage
