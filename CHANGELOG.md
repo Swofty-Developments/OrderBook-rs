@@ -88,23 +88,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Ok` while the maker was gone. The arms now cancel only when the sweep
   can still execute into the same-user maker, with two guards: a budget
   the pre-match exhausted (`is_done()`) is an ordinary complete fill, and
-  a residual that cannot fund one more lot at the level's price
-  (`level_qty_cap == 0` — the quote-amount case, since a notional budget
-  normally ends in dust below one unit rather than at exactly zero, and
-  the lot-rounded case) leaves the maker untouched and walks on to the
-  next level instead of breaking, because a quote-amount sell can still
-  afford a whole lot at a cheaper bid further down. The modify precheck
+  quote-notional dust — a residual that cannot fund one more lot at the
+  level's price, the usual end of a notional sweep since the budget rarely
+  lands on exactly zero, and the lot-rounded case — leaves the maker
+  untouched and walks on to the next level instead of breaking, because a
+  quote-amount sell can still afford a whole lot at a cheaper bid further
+  down. A base-quantity residual keeps the STP verdict whatever its size:
+  a maker admitted before a lot-size change keeps resting with a
+  misaligned tranche (documented on `set_lot_size`), so a sub-lot
+  residual is reachable, and walked past it would rest crossed against
+  the taker's own maker. The modify precheck
   `check_modify_stp_self_cross` (#168) rejected a reprice as soon as any
   same-user order rested at a crossed level, before subtracting the
-  non-self depth queued ahead of it; it now consults the same
-  insertion-sequence `check_stp_at_level` verdict the sweep uses, so a
-  reprice the non-self depth covers is admitted and one it does not
-  cover is still refused before the original is cancelled. Pinned for
-  base-quantity, fill-or-kill and market takers, quote-amount buys (dust
-  and reachable), a quote-amount sell past an unaffordable self level, a
-  lot-rounded residual, the exact-depth boundary, and same-level reprices
-  (admitted and refused); a reachable maker still yields
-  `SelfTradePrevented` with the true non-self fill.
+  non-self depth queued ahead of it; it now mirrors the sweep's
+  lot-rounded per-level cap and consults the same insertion-sequence
+  `check_stp_at_level` verdict, so a reprice the non-self depth covers is
+  admitted, one it does not cover is still refused before the original is
+  cancelled, and dust the sweep stops on before a deeper same-user level
+  is admitted exactly as a direct submit is. Pinned for base-quantity,
+  fill-or-kill and market takers, quote-amount buys (dust and reachable),
+  a quote-amount sell past an unaffordable self level, a lot-rounded
+  notional residual, a sub-lot reserve tranche resting from before a
+  lot-size change (sweep and reprice),
+  precheck/sweep agreement on dust before a deeper self level, the
+  exact-depth boundary, and same-level reprices (admitted and refused); a
+  reachable maker still yields `SelfTradePrevented` with the true non-self
+  fill.
 
 - **A reserve residual follows `auto_replenish` (#230).**
   `reduce_reserve_to_total` — the residual-resting helper behind

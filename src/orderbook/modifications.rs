@@ -1543,11 +1543,21 @@ where
             Side::Sell => Either::Right(opposite.iter().rev()),
         };
 
+        let lot = self.lot_size.unwrap_or(1);
         let mut remaining = new_order.total_quantity();
         for entry in iter {
-            if remaining == 0 {
-                // The taker fully fills against non-self depth before reaching
-                // any same-user maker → the engine never cancels it.
+            // Lot-round the remaining budget exactly like the sweep's
+            // `StopCondition::level_qty_cap`. A spent budget is a complete
+            // fill, and a residual below one lot is dust the sweep stops on
+            // before it scans another level (it rests, STP never consulted),
+            // so neither can reach a same-user maker → the engine never
+            // cancels the taker.
+            let cap = if lot <= 1 {
+                remaining
+            } else {
+                remaining - (remaining % lot)
+            };
+            if cap == 0 {
                 return Ok(());
             }
             let price = *entry.key();
@@ -1567,18 +1577,23 @@ where
             match check_stp_at_level(&orders, taker_user_id, self.stp_mode) {
                 STPAction::NoConflict => {
                     // No same-user maker at this level: the taker consumes its
-                    // full matchable depth (the authoritative upstream dry run),
-                    // then walks on.
-                    remaining = remaining
-                        .saturating_sub(level.matchable_quantity(remaining, new_order.id()));
+                    // full matchable depth under the lot-rounded cap (the
+                    // authoritative upstream dry run), then walks on.
+                    remaining =
+                        remaining.saturating_sub(level.matchable_quantity(cap, new_order.id()));
                 }
                 STPAction::CancelTaker { safe_quantity }
                 | STPAction::CancelBoth { safe_quantity, .. } => {
-                    // The sweep fills up to `safe_quantity` against the non-self
-                    // depth queued ahead of the same-user maker and cancels the
-                    // taker only if quantity is still left after that. A taker
-                    // the non-self depth satisfies never reaches its own maker.
-                    if remaining > safe_quantity {
+                    // The sweep pre-matches `min(cap, safe_quantity)` against
+                    // the non-self depth queued ahead of the same-user maker
+                    // and cancels the taker only if quantity is still left
+                    // after that. A modify is always base quantity, and a
+                    // base residual is never walked past (only quote-notional
+                    // dust is), so any residual here is the engine's cancel
+                    // verdict; a taker the non-self depth satisfies never
+                    // reaches its own maker.
+                    remaining = remaining.saturating_sub(cap.min(safe_quantity));
+                    if remaining > 0 {
                         return Err(OrderBookError::SelfTradePrevented {
                             mode: self.stp_mode,
                             taker_order_id: new_order.id(),

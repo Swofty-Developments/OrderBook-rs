@@ -8,8 +8,8 @@
 //! level, where a cheaper bid may still be affordable. A base-quantity
 //! residual keeps the STP verdict whatever its size, since walked past it
 //! would rest crossed against the taker's own maker.
-//! `check_modify_stp_self_cross` applies the same per-level FIFO rule on
-//! the modify path.
+//! `check_modify_stp_self_cross` applies the same per-level FIFO rule and
+//! the same lot-rounded per-level cap on the modify path.
 
 #[cfg(test)]
 mod tests_stp_reachability {
@@ -637,6 +637,149 @@ mod tests_stp_reachability {
                     5
                 ),
             }
+        }
+    }
+
+    /// The precheck reaches the same verdict for that book: a reprice of 5
+    /// into the level is refused before the original is cancelled.
+    #[test]
+    fn repricing_behind_a_sub_lot_reserve_is_refused_before_cancel() {
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let book = book_with_sub_lot_reserve_ahead(mode, true);
+            book.add_limit_order_with_user(
+                Id::from_u64(TAKER),
+                90,
+                5,
+                Side::Buy,
+                TimeInForce::Gtc,
+                user(1),
+                None,
+            )
+            .expect("rest the bid below the market");
+
+            let err = book
+                .update_order(OrderUpdate::UpdatePrice {
+                    order_id: Id::from_u64(TAKER),
+                    new_price: Price::new(PRICE),
+                })
+                .expect_err("3 visible lots cannot cover 5");
+            assert!(
+                matches!(err, OrderBookError::SelfTradePrevented { .. }),
+                "{mode}: expected SelfTradePrevented, got {err:?}"
+            );
+            let original = book
+                .get_order(Id::from_u64(TAKER))
+                .unwrap_or_else(|| panic!("{mode}: the original survives a refused reprice"));
+            assert_eq!(original.price().as_u128(), 90);
+            assert_eq!(
+                book.get_order(Id::from_u64(OTHER_MAKER))
+                    .unwrap_or_else(|| panic!("{mode}: nothing traded"))
+                    .visible_quantity()
+                    .as_u64(),
+                3
+            );
+            assert_self_maker_intact_at(&book, 5);
+        }
+    }
+
+    /// Dust the sweep stops on before a deeper same-user level is not an STP
+    /// decision at all: the sweep breaks on a zero lot-rounded cap and never
+    /// scans that level. The precheck mirrors the same cap, so its verdict
+    /// on a reprice equals the engine's verdict on the same order submitted
+    /// directly — checked here on twin books rather than by asserting the
+    /// engine's dust handling itself.
+    #[test]
+    fn precheck_agrees_with_the_sweep_on_sub_lot_dust_before_a_deeper_self_level() {
+        const DEEPER: u128 = PRICE + 1;
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let build = || {
+                let mut book: OrderBook<()> = DefaultOrderBook::new("STPD");
+                book.set_stp_mode(mode);
+                book.set_order_state_tracker(OrderStateTracker::new());
+                // Non-replenishing, admitted before the lot size is set: the
+                // sweep draws the visible 3 and leaves the hidden 2 undrawn,
+                // so a taker of 5 keeps a residual of 2.
+                book.add_order(OrderType::ReserveOrder {
+                    id: Id::from_u64(OTHER_MAKER),
+                    price: Price::new(PRICE),
+                    visible_quantity: Quantity::new(3),
+                    hidden_quantity: Quantity::new(2),
+                    side: Side::Sell,
+                    user_id: user(2),
+                    timestamp: TimestampMs::new(0),
+                    time_in_force: TimeInForce::Gtc,
+                    replenish_threshold: Quantity::new(1),
+                    replenish_amount: None,
+                    auto_replenish: false,
+                    extra_fields: (),
+                })
+                .expect("seed reserve before the lot size is set");
+                book.add_limit_order_with_user(
+                    Id::from_u64(SELF_MAKER),
+                    DEEPER,
+                    5,
+                    Side::Sell,
+                    TimeInForce::Gtc,
+                    user(1),
+                    None,
+                )
+                .expect("seed same-user maker one level deeper");
+                book.set_lot_size(5);
+                book
+            };
+
+            let repriced = build();
+            repriced
+                .add_limit_order_with_user(
+                    Id::from_u64(TAKER),
+                    90,
+                    5,
+                    Side::Buy,
+                    TimeInForce::Gtc,
+                    user(1),
+                    None,
+                )
+                .expect("rest the bid below the market");
+            let via_modify = repriced
+                .update_order(OrderUpdate::UpdatePrice {
+                    order_id: Id::from_u64(TAKER),
+                    new_price: Price::new(DEEPER),
+                })
+                .map(|_| ());
+
+            let direct = build();
+            let via_add = direct
+                .add_limit_order_with_user(
+                    Id::from_u64(TAKER),
+                    DEEPER,
+                    5,
+                    Side::Buy,
+                    TimeInForce::Gtc,
+                    user(1),
+                    None,
+                )
+                .map(|_| ());
+
+            assert_eq!(
+                via_modify.is_ok(),
+                via_add.is_ok(),
+                "{mode}: precheck verdict {via_modify:?} vs engine verdict {via_add:?}"
+            );
+            let state = |book: &OrderBook<()>| {
+                (
+                    book.get_order(Id::from_u64(TAKER))
+                        .map(|o| (o.price().as_u128(), o.visible_quantity().as_u64())),
+                    book.get_order(Id::from_u64(SELF_MAKER))
+                        .map(|o| o.visible_quantity().as_u64()),
+                    book.get_order(Id::from_u64(OTHER_MAKER))
+                        .map(|o| o.visible_quantity().as_u64()),
+                )
+            };
+            assert_eq!(
+                state(&repriced),
+                state(&direct),
+                "{mode}: the repriced book and the directly-submitted book agree"
+            );
         }
     }
 
