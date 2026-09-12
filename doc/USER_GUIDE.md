@@ -147,6 +147,17 @@ println!("Average price: {}", result.average_price());
   `OrderUpdate::UpdateQuantity`, `OrderUpdate::UpdatePriceAndQuantity` and
   `OrderUpdate::Replace`. `add_iceberg_order` takes the visible and hidden
   tranches as separate arguments
+- On a book with a lot size the two tranches are validated individually,
+  not on the total: a 15 visible / 5 hidden split is rejected on a lot-10
+  book even though its total of 20 is a whole multiple. A Reserve order is
+  additionally validated on the quantity its replenishment would move into
+  the visible tranche, capped by the hidden tranche:
+  `min(replenish_amount, hidden)` when an explicit amount is set;
+  `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, hidden)` when there is no explicit
+  amount and `auto_replenish` is on; nothing otherwise, and nothing when the
+  order carries no hidden tranche. `replenish_threshold` is unrestricted.
+  Rejections return `OrderBookError::InvalidLotSize` naming the offending
+  quantity
 
 **Time-In-Force:**
 - `Gtc` (Good-Till-Cancel): Remain until filled or cancelled
