@@ -185,6 +185,26 @@ impl std::fmt::Display for OrderStatus {
 /// * `old_status` — the previous status (or the new status if this is the
 ///   first transition, i.e., `Open` or `Rejected`)
 /// * `new_status` — the status after the transition
+///
+/// # Re-entrancy contract (#209, #225)
+///
+/// Transitions are recorded from inside the book operation that caused
+/// them, so the listener may fire while the book's submit gate is held —
+/// and usually does. (The exception is the kill-switch rejection recorded
+/// by `check_kill_switch_or_reject`, which the `submit_market_order`
+/// family runs before taking the gate at all.) Since #225 that hold is
+/// exclusive for fill-or-kill submits and for self-trade-prevention
+/// relevant submits and matching-capable modifies. Like
+/// [`TradeListener`](crate::orderbook::trade::TradeListener), it must
+/// never call back into the same `OrderBook`'s mutating API (add / submit
+/// / cancel / update / mass cancel / market sweeps) on the invoking
+/// thread: the gate is not reentrant, so the nested acquisition **may**
+/// deadlock — a nested shared acquisition of `std::sync::RwLock` is
+/// unspecified and may succeed, panic or block — and it **always**
+/// deadlocks when the gate is held exclusively. The prohibition is
+/// absolute: a listener that happens to work today on an `STPMode::None`
+/// book will hang the moment STP is enabled. Hand the transition off to a
+/// queue or channel instead.
 pub type OrderStateListener = Arc<dyn Fn(Id, &OrderStatus, &OrderStatus) + Send + Sync>;
 
 /// Default number of terminal-state entries to retain before eviction.

@@ -267,8 +267,13 @@ where
         limit_price: Option<u128>,
         taker_user_id: Hash32,
     ) -> Result<MatchResult, OrderBookError> {
-        // #209: shared submit gate (see `match_order`).
-        let _gate = self.submit_gate_read();
+        // #209: submit gate (see `match_order`). #225: exclusive when STP
+        // is engaged for this taker, so the per-level scan and the fill it
+        // authorises see the same queue state. Match-only entry points
+        // always sweep as `TakerKind::Standard`, hence `is_post_only =
+        // false`.
+        let _gate =
+            self.acquire_submit_gate(self.submit_needs_exclusive_gate(false, taker_user_id, false));
         self.match_order_with_user_outcome(
             order_id,
             side,
@@ -490,6 +495,17 @@ where
                 price_level.snapshot_by_seq_into(&mut stp_orders);
                 let action = check_stp_at_level(&stp_orders, taker_user_id, self.stp_mode);
 
+                // #225: test-only interleaving point. The verdict above was
+                // taken on the queue state we just snapshotted; this is the
+                // exact instant a competing mutation used to be able to slip
+                // in before the level is acted on below. The hook lets a unit
+                // test park here and drive that competitor deterministically.
+                // Compiled out entirely outside `cfg(test)`.
+                #[cfg(test)]
+                if let Some(hook) = self.stp_interleave_hook.as_ref() {
+                    hook(price);
+                }
+
                 match action {
                     STPAction::NoConflict => {
                         // No self-trade at this level; match normally below
@@ -507,6 +523,17 @@ where
                                     taker_kind,
                                     taker_ts,
                                     &self.transaction_id_generator,
+                                );
+                                // #225: every maker filled here must come
+                                // from the snapshot the STP verdict was taken
+                                // on. A maker outside it means something
+                                // landed between the scan and the sweep, i.e.
+                                // the exclusive submit gate was not held.
+                                debug_assert!(
+                                    price_level_match.trades().as_vec().iter().all(|t| {
+                                        stp_orders.iter().any(|o| o.id() == t.maker_order_id())
+                                    }),
+                                    "#225: CancelTaker pre-match filled a maker absent from the STP snapshot"
                                 );
                                 let executed = match_qty.saturating_sub(
                                     price_level_match.remaining_quantity().as_u64(),
@@ -573,6 +600,15 @@ where
                                     taker_ts,
                                     &self.transaction_id_generator,
                                 );
+                                // #225: see the CancelTaker arm — the makers
+                                // filled here must all belong to the snapshot
+                                // the STP verdict was taken on.
+                                debug_assert!(
+                                    price_level_match.trades().as_vec().iter().all(|t| {
+                                        stp_orders.iter().any(|o| o.id() == t.maker_order_id())
+                                    }),
+                                    "#225: CancelBoth pre-match filled a maker absent from the STP snapshot"
+                                );
                                 let executed = match_qty.saturating_sub(
                                     price_level_match.remaining_quantity().as_u64(),
                                 );
@@ -614,6 +650,18 @@ where
                 taker_kind,
                 taker_ts,
                 &self.transaction_id_generator,
+            );
+            // #225: when STP ran for this level, the sweep may only fill
+            // makers the verdict was taken on. `stp_orders` is only populated
+            // while `stp_active`, hence the guard.
+            debug_assert!(
+                !stp_active
+                    || price_level_match
+                        .trades()
+                        .as_vec()
+                        .iter()
+                        .all(|t| { stp_orders.iter().any(|o| o.id() == t.maker_order_id()) }),
+                "#225: sweep filled a maker absent from the STP snapshot"
             );
             let executed = qty_cap.saturating_sub(price_level_match.remaining_quantity().as_u64());
 

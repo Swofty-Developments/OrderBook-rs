@@ -290,9 +290,14 @@ where
         &self,
         update: OrderUpdate,
     ) -> Result<Option<Arc<OrderType<T>>>, OrderBookError> {
-        // #209: shared submit gate for the whole modify — its internal
+        // #209: submit gate for the whole modify — its internal
         // cancel-then-add sequences call the ungated inner variants.
-        let _gate = self.submit_gate_read();
+        // #225: exclusive when STP is engaged and the variant re-adds an
+        // order that can match, so the guard spans validation through the
+        // re-add and no concurrent admission, cancel or modify can land
+        // between the re-add's STP scan and its fill. Repricing inherits
+        // this path, so pegged / trailing-stop re-prices are covered too.
+        let _gate = self.acquire_submit_gate(self.modify_needs_exclusive_gate(&update));
         // Gate non-cancel variants on the kill switch. Cancel passes
         // through unchanged so operators can drain the book. The
         // existing order stays live — only the modification is
@@ -377,17 +382,20 @@ where
                     // post-cancel the account count is restored so its risk
                     // check passes — consistent with the pre-guard.
                     // Ungated inner variants: `update_order` already holds
-                    // the shared submit gate (#209); the public wrappers
+                    // the submit gate (#209 / #225); the public wrappers
                     // would re-acquire it (std RwLock is not reentrant).
-                    // The re-add runs under the SHARED gate, so it must
-                    // never be a fill-or-kill (whose all-or-nothing window
-                    // requires the exclusive gate). Unreachable today — an
-                    // FOK never rests, so it can never be modified — but
-                    // enforced so a future TIF change cannot silently void
-                    // the #209 guarantee.
+                    // The gate mode was chosen once at the boundary by
+                    // `modify_needs_exclusive_gate` — exclusive whenever STP
+                    // is engaged — and it is never upgraded here, so the
+                    // re-add must never be a fill-or-kill (whose
+                    // all-or-nothing window always requires the exclusive
+                    // gate, including on an `STPMode::None` book).
+                    // Unreachable today — an FOK never rests, so it can
+                    // never be modified — but enforced so a future TIF
+                    // change cannot silently void the #209 guarantee.
                     debug_assert!(
                         !new_order.is_fill_or_kill(),
-                        "a resting order can never carry FOK; the shared-gate re-add relies on it"
+                        "a resting order can never carry FOK; the re-add cannot upgrade the gate"
                     );
                     self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
                     let result = self.add_order_inner(new_order, false)?.0;
@@ -556,17 +564,20 @@ where
                     // Both checks passed: cancel the original and add the
                     // updated order.
                     // Ungated inner variants: `update_order` already holds
-                    // the shared submit gate (#209); the public wrappers
+                    // the submit gate (#209 / #225); the public wrappers
                     // would re-acquire it (std RwLock is not reentrant).
-                    // The re-add runs under the SHARED gate, so it must
-                    // never be a fill-or-kill (whose all-or-nothing window
-                    // requires the exclusive gate). Unreachable today — an
-                    // FOK never rests, so it can never be modified — but
-                    // enforced so a future TIF change cannot silently void
-                    // the #209 guarantee.
+                    // The gate mode was chosen once at the boundary by
+                    // `modify_needs_exclusive_gate` — exclusive whenever STP
+                    // is engaged — and it is never upgraded here, so the
+                    // re-add must never be a fill-or-kill (whose
+                    // all-or-nothing window always requires the exclusive
+                    // gate, including on an `STPMode::None` book).
+                    // Unreachable today — an FOK never rests, so it can
+                    // never be modified — but enforced so a future TIF
+                    // change cannot silently void the #209 guarantee.
                     debug_assert!(
                         !new_order.is_fill_or_kill(),
-                        "a resting order can never carry FOK; the shared-gate re-add relies on it"
+                        "a resting order can never carry FOK; the re-add cannot upgrade the gate"
                     );
                     self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
                     let result = self.add_order_inner(new_order, false)?.0;
@@ -755,17 +766,20 @@ where
                     // Both checks passed: cancel the original and add the
                     // new order.
                     // Ungated inner variants: `update_order` already holds
-                    // the shared submit gate (#209); the public wrappers
+                    // the submit gate (#209 / #225); the public wrappers
                     // would re-acquire it (std RwLock is not reentrant).
-                    // The re-add runs under the SHARED gate, so it must
-                    // never be a fill-or-kill (whose all-or-nothing window
-                    // requires the exclusive gate). Unreachable today — an
-                    // FOK never rests, so it can never be modified — but
-                    // enforced so a future TIF change cannot silently void
-                    // the #209 guarantee.
+                    // The gate mode was chosen once at the boundary by
+                    // `modify_needs_exclusive_gate` — exclusive whenever STP
+                    // is engaged — and it is never upgraded here, so the
+                    // re-add must never be a fill-or-kill (whose
+                    // all-or-nothing window always requires the exclusive
+                    // gate, including on an `STPMode::None` book).
+                    // Unreachable today — an FOK never rests, so it can
+                    // never be modified — but enforced so a future TIF
+                    // change cannot silently void the #209 guarantee.
                     debug_assert!(
                         !new_order.is_fill_or_kill(),
-                        "a resting order can never carry FOK; the shared-gate re-add relies on it"
+                        "a resting order can never carry FOK; the re-add cannot upgrade the gate"
                     );
                     self.cancel_order_with_reason(order_id, CancelReason::UserRequested)?;
                     let result = self.add_order_inner(new_order, false)?.0;
@@ -1297,7 +1311,14 @@ where
     pub fn add_order(&self, order: OrderType<T>) -> Result<Arc<OrderType<T>>, OrderBookError> {
         // #209: shared gate for ordinary submits, exclusive for FOK so its
         // feasibility + sweep window excludes every concurrent mutation.
-        let _gate = self.acquire_submit_gate(order.is_fill_or_kill());
+        // #225: also exclusive for an STP-relevant submit, so the per-level
+        // STP scan and the fill it authorises see the same queue state. A
+        // post-only submit never reaches that scan, so it stays shared.
+        let _gate = self.acquire_submit_gate(self.submit_needs_exclusive_gate(
+            order.is_fill_or_kill(),
+            order.user_id(),
+            order.is_post_only(),
+        ));
         self.add_order_inner(order, false).map(|(order, _)| order)
     }
 
@@ -1337,8 +1358,12 @@ where
         &self,
         order: OrderType<T>,
     ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), OrderBookError> {
-        // #209: same gating as `add_order`.
-        let _gate = self.acquire_submit_gate(order.is_fill_or_kill());
+        // #209 / #225: same gating as `add_order`.
+        let _gate = self.acquire_submit_gate(self.submit_needs_exclusive_gate(
+            order.is_fill_or_kill(),
+            order.user_id(),
+            order.is_post_only(),
+        ));
         self.add_order_inner(order, true)
     }
 

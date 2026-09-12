@@ -18,7 +18,6 @@ use crossbeam::atomic::AtomicCell;
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
 use either::Either;
-#[cfg(feature = "special_orders")]
 use pricelevel::OrderUpdate;
 use pricelevel::{Hash32, Id, MatchResult, OrderType, PriceLevel, Side, UuidGenerator};
 use serde::Serialize;
@@ -107,19 +106,54 @@ pub struct OrderBook<T = ()> {
     /// A cache for storing best bid/ask prices to avoid recalculation
     pub(super) cache: PriceLevelCache,
 
-    /// Book-level linearization gate for multi-level fill-or-kill (#209).
+    /// Book-level linearization gate for decisions that span two
+    /// operations: multi-level fill-or-kill (#209) and self-trade
+    /// prevention (#225).
     ///
-    /// Every mutating entry point takes the **read** side (uncontended:
-    /// one atomic RMW pair); a fill-or-kill submit takes the **write**
-    /// side across its feasibility check and sweep, so no concurrent
-    /// add / cancel / update can invalidate the all-or-nothing decision
-    /// between the two. This is deliberately `std::sync::RwLock` — the
-    /// contention case (FOK flow) is rare, and a skiplist / dashmap is
+    /// Every mutating entry point takes a side of this gate. A fill-or-kill
+    /// submit takes the **write** side across its feasibility check and
+    /// sweep, and an STP-relevant submit or matching-capable modify takes it
+    /// across its per-level scan and the fill that scan authorises, so no
+    /// concurrent add / cancel / update can invalidate either decision
+    /// between the two steps. Everything else takes the **read** side and
+    /// stays fully concurrent. [`OrderBook::acquire_submit_gate`] is the
+    /// single place that picks the mode, and it documents the scope
+    /// limitation.
+    ///
+    /// # Cost of enabling STP
+    ///
+    /// On an `STPMode::None` book the exclusive side is taken only by
+    /// fill-or-kill submits, which are rare. **Enabling any other
+    /// [`STPMode`] serializes the book**: `validate_order_shape` rejects a
+    /// zero `user_id` with [`OrderBookError::MissingUserId`], so every
+    /// admissible `add_order` carries an identity, and every one of them
+    /// that can take liquidity — plus every `UpdatePrice` /
+    /// `UpdatePriceAndQuantity` / `Replace` and every market sweep that
+    /// names a user — runs one at a time on that book. Only post-only
+    /// submits (which never reach the STP scan), `UpdateQuantity`, cancels,
+    /// mass cancels and anonymous match-only sweeps keep the shared side.
+    /// This is the price of the #225 guarantee and it should be weighed
+    /// before turning STP on for a hot symbol.
+    ///
+    /// This is deliberately `std::sync::RwLock` — a skiplist / dashmap is
     /// the wrong shape for an exclusion window (see CLAUDE.md). The
     /// matching hot path itself stays lock-free; the gate wraps entry
     /// points only and is never held across `.await` (the core is
     /// synchronous).
     pub(super) submit_gate: std::sync::RwLock<()>,
+
+    /// Test-only interleaving point for the per-level self-trade-prevention
+    /// scan (#225).
+    ///
+    /// Fires inside `match_order_with_user_outcome` right after
+    /// `check_stp_at_level` has produced its verdict for a price level and
+    /// before that verdict is acted on, receiving the level's price. It lets
+    /// a unit test park the taker exactly inside the former check-then-act
+    /// window and drive a competing thread against it deterministically,
+    /// with no sleeps. The field exists only in `cfg(test)` builds, so
+    /// neither the hook nor its `Option` check reaches a release binary.
+    #[cfg(test)]
+    pub(super) stp_interleave_hook: Option<std::sync::Arc<dyn Fn(u128) + Send + Sync>>,
 
     /// listens to possible trades when an order is added
     pub trade_listener: Option<TradeListener>,
@@ -450,6 +484,8 @@ where
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
+            #[cfg(test)]
+            stp_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -750,8 +786,9 @@ where
     }
 
     /// Acquire the exclusive (write) side of the submit gate for a
-    /// fill-or-kill submit (#209). See [`Self::submit_gate_read`] for the
-    /// poisoning policy.
+    /// fill-or-kill submit (#209), an STP-relevant submit or
+    /// matching-capable modify, and the live snapshot restore commit
+    /// (#225). See [`Self::submit_gate_read`] for the poisoning policy.
     pub(super) fn submit_gate_write(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
         self.submit_gate.write().unwrap_or_else(|poisoned| {
             tracing::error!("submit gate poisoned by a prior panic; recovering write guard");
@@ -759,26 +796,139 @@ where
         })
     }
 
-    /// Acquire the submit gate in the mode the submit needs: exclusive
-    /// for fill-or-kill (its multi-level all-or-nothing decision must not
-    /// interleave with any other mutation), shared for everything else.
+    /// Acquire the submit gate in the mode the operation needs: exclusive
+    /// for a fill-or-kill submit (#209) and for every self-trade-prevention
+    /// relevant, matching-capable submit or modify (#225); shared for
+    /// everything else.
+    ///
+    /// # Why exclusive
+    ///
+    /// Both cases make a decision by reading book state and then act on
+    /// that decision in a second, separate operation:
+    ///
+    /// - fill-or-kill checks multi-level feasibility, then sweeps;
+    /// - an STP-active submit snapshots a price level's queue, decides the
+    ///   [`STPAction`](super::stp::STPAction) for it, then fills it.
+    ///
+    /// Under the shared side another thread can mutate the level in
+    /// between, so the decision is applied to state it was never taken on
+    /// — a concurrent same-user admission could land behind an STP scan
+    /// that found the level clean and then be filled by the very sweep the
+    /// scan was protecting.
+    ///
+    /// # Boundary
+    ///
+    /// Every mutation performed through the `OrderBook` API either passes
+    /// this gate or takes `&mut self` (the snapshot-package and JSON restore
+    /// variants, exclusive by construction), so the exclusive holder
+    /// observes a frozen book: its scan and
+    /// its sweep see the same queue state, and a competing admission
+    /// blocks here and runs against the post-decision state instead.
+    ///
+    /// Scope limitation: mutation performed directly on the
+    /// `Arc<PriceLevel>` handles returned by
+    /// [`get_bids`](Self::get_bids) / [`get_asks`](Self::get_asks)
+    /// bypasses the gate entirely and is outside this guarantee (tracked
+    /// in #228).
     ///
     /// # Invariant: no nested acquisition
     ///
-    /// `std::sync::RwLock` is not reentrant, and the platform
-    /// implementations are writer-preferring — a nested read acquisition
-    /// deadlocks whenever a writer is queued in between. Gate acquisition
-    /// therefore lives ONLY in the public mutating entry points, which
-    /// call ungated inner variants for any internal composition
-    /// (`add_order_inner`, `cancel_order_with_reason`,
-    /// `match_order_with_user_outcome`). The same rule extends to user
-    /// callbacks: see the re-entrancy contract on
-    /// [`TradeListener`] and [`PriceLevelChangedListener`].
+    /// `std::sync::RwLock` is not reentrant, so a nested acquisition may
+    /// deadlock. Gate acquisition therefore lives ONLY in the public
+    /// mutating entry points, which call ungated inner variants for any
+    /// internal composition (`add_order_inner`,
+    /// `cancel_order_with_reason`, `match_order_with_user_outcome`). The
+    /// same rule extends to user callbacks: see the re-entrancy contract
+    /// on [`TradeListener`], [`PriceLevelChangedListener`] and
+    /// [`OrderStateListener`](super::order_state::OrderStateListener).
     pub(super) fn acquire_submit_gate(&self, exclusive: bool) -> SubmitGateGuard<'_> {
         if exclusive {
             SubmitGateGuard::Write(self.submit_gate_write())
         } else {
             SubmitGateGuard::Read(self.submit_gate_read())
+        }
+    }
+
+    /// Decide the submit gate mode for an incoming order (#209 / #225).
+    ///
+    /// Returns `true` — exclusive — when either:
+    ///
+    /// - the order is fill-or-kill, whose feasibility check and sweep must
+    ///   not interleave with any other mutation (#209); or
+    /// - self-trade prevention is engaged on this book, the taker carries a
+    ///   real identity, and the taker can actually take liquidity, so the
+    ///   per-level STP scan and the fill it authorises must observe the same
+    ///   queue state (#225).
+    ///
+    /// # Why post-only is excluded
+    ///
+    /// A post-only taker never runs the STP scan: the post-only branch in
+    /// `match_order_with_user_outcome` resolves each crossing level with
+    /// `break` (rejected) or `continue` (walk on) *before* the STP block is
+    /// reached, so it has no check-then-act window of its own. Its
+    /// reject-or-rest decision is `pricelevel`'s structural probe, which is
+    /// linearized on the level itself and never trades (#209), and STP is
+    /// deliberately never consulted for it. Post-only is excluded from an
+    /// *identified* taker's window by that taker holding the write side, not
+    /// by taking the write side itself — which is exactly what T1 of the
+    /// #225 suite exercises, with the post-only as the blocked competitor.
+    ///
+    /// # Why anonymous takers stay shared
+    ///
+    /// `match_order_with_user_outcome` skips the STP scan entirely for a
+    /// zero `taker_user_id` (see
+    /// [`check_stp_at_level`](super::stp::check_stp_at_level)), so there is
+    /// no window to protect. On an STP-enabled book that shared path is
+    /// reachable **only** through the match-only entry points —
+    /// [`match_order_with_user`](Self::match_order_with_user),
+    /// [`match_market_order_with_user`](Self::match_market_order_with_user)
+    /// and
+    /// [`match_market_order_by_amount_with_user`](Self::match_market_order_by_amount_with_user)
+    /// — because `validate_order_shape` rejects an `add_order` carrying
+    /// `Hash32::zero()` with [`OrderBookError::MissingUserId`]. An anonymous
+    /// taker therefore does not buy back concurrency for identified flow: it
+    /// still blocks behind, and is blocked by, every identified submit.
+    ///
+    /// Books left on [`STPMode::None`] keep the shared, fully concurrent
+    /// submit path for every order.
+    #[inline]
+    #[must_use]
+    pub(super) fn submit_needs_exclusive_gate(
+        &self,
+        is_fill_or_kill: bool,
+        taker_user_id: Hash32,
+        is_post_only: bool,
+    ) -> bool {
+        is_fill_or_kill
+            || (self.stp_mode.is_enabled() && taker_user_id != Hash32::zero() && !is_post_only)
+    }
+
+    /// Decide the submit gate mode for an [`OrderUpdate`] (#225).
+    ///
+    /// Returns `true` — exclusive — when STP is engaged and the variant is
+    /// one of the cancel-then-add forms whose re-add can match against the
+    /// book (`UpdatePrice`, `UpdatePriceAndQuantity`, `Replace`). Those
+    /// re-adds run the same per-level STP scan as a fresh submit, so they
+    /// carry the same check-then-act window.
+    ///
+    /// `UpdateQuantity` adjusts a resting order in place and `Cancel`
+    /// only removes one, so neither can match and both keep the shared
+    /// side. With STP disabled every variant stays shared.
+    #[inline]
+    #[must_use]
+    pub(super) fn modify_needs_exclusive_gate(&self, update: &OrderUpdate) -> bool {
+        if !self.stp_mode.is_enabled() {
+            return false;
+        }
+        // Exhaustive on purpose: a new `OrderUpdate` variant must force an
+        // explicit decision here rather than silently inherit the shared
+        // side. `OrderUpdate` is not `#[non_exhaustive]` in pricelevel
+        // 0.9.1, so no wildcard arm is needed.
+        match update {
+            OrderUpdate::UpdatePrice { .. }
+            | OrderUpdate::UpdatePriceAndQuantity { .. }
+            | OrderUpdate::Replace { .. } => true,
+            OrderUpdate::UpdateQuantity { .. } | OrderUpdate::Cancel { .. } => false,
         }
     }
 
@@ -868,6 +1018,8 @@ where
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
+            #[cfg(test)]
+            stp_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -917,6 +1069,8 @@ where
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
+            #[cfg(test)]
+            stp_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -2866,8 +3020,13 @@ where
             "Order book {}: Matching notional market order {} for {} at side {:?}",
             self.symbol, order_id, amount, side
         );
-        // #209: shared submit gate — notional market sweeps mutate the book.
-        let _gate = self.submit_gate_read();
+        // #209: submit gate — notional market sweeps mutate the book.
+        // #225: exclusive when STP is engaged for this taker, so the
+        // per-level scan and the fill it authorises see the same queue. A
+        // notional sweep always takes liquidity, hence `is_post_only =
+        // false`.
+        let _gate =
+            self.acquire_submit_gate(self.submit_needs_exclusive_gate(false, user_id, false));
         let match_result =
             OrderBook::<T>::match_order_by_amount_with_user(self, order_id, side, amount, user_id)?;
 
@@ -3185,9 +3344,27 @@ where
     /// [`OrderBookError::DuplicateOrderId`] when the same order id
     /// appears in more than one level of the snapshot (installing it
     /// would silently orphan one of the two in `order_locations`).
+    ///
+    /// # Concurrency (#225)
+    ///
+    /// The commit phase holds the **exclusive** side of the submit gate, so
+    /// it never interleaves with an in-flight submit, cancel or modify.
+    /// Like every gated entry point it must not be called from a
+    /// [`TradeListener`], [`PriceLevelChangedListener`] or
+    /// [`OrderStateListener`](super::order_state::OrderStateListener)
+    /// on the invoking thread: the gate is not reentrant and the nested
+    /// acquisition deadlocks.
     pub fn restore_from_snapshot(&self, snapshot: OrderBookSnapshot) -> Result<(), OrderBookError> {
         self.ensure_snapshot_symbol(&snapshot)?;
         let prepared = Self::prepare_snapshot_levels(snapshot)?;
+        // #225: a live restore replaces every level and rebuilds the
+        // `order_locations` / `user_orders` indices, so it must exclude
+        // every in-flight submit, cancel and modify exactly like a
+        // fill-or-kill or an STP-relevant submit does. The snapshot was
+        // validated above without touching the book; only the commit
+        // needs the exclusive side. `commit_restored_levels` acquires
+        // nothing itself, so this is the single acquisition.
+        let _gate = self.submit_gate_write();
         self.commit_restored_levels(&prepared, false);
         Ok(())
     }
@@ -3893,6 +4070,12 @@ where
     /// `if ...is_ok()`; now it is surfaced (#174). A peg that simply has no
     /// reference / no valid passive tick this cycle is a no-op, not a failure,
     /// and is not recorded.
+    ///
+    /// Each re-price goes through the public, gated `update_order`, so on an
+    /// STP-enabled book this loop takes and releases the exclusive submit
+    /// gate once per order (#225). Correct and deadlock-free — the gate is
+    /// never held across iterations — but the sweep is not atomic as a
+    /// batch: concurrent flow interleaves between consecutive re-prices.
     fn reprice_pegged_collecting(&self, failures: &mut Vec<(Id, String)>) -> usize {
         let pegged_ids = self.special_order_tracker.pegged_order_ids();
         if pegged_ids.is_empty() {
@@ -3967,7 +4150,9 @@ where
 
     /// Re-price every trailing stop, returning the count repriced and pushing a
     /// `(order_id, reason)` pair onto `failures` for each rejected
-    /// `update_order` (mirrors [`Self::reprice_pegged_collecting`], #174).
+    /// `update_order` (mirrors [`Self::reprice_pegged_collecting`], #174),
+    /// including its per-order gate acquisition and the batch-atomicity
+    /// caveat that comes with it (#225).
     fn reprice_trailing_collecting(&self, failures: &mut Vec<(Id, String)>) -> usize {
         let trailing_ids = self.special_order_tracker.trailing_stop_ids();
         if trailing_ids.is_empty() {
@@ -4153,12 +4338,21 @@ struct PreparedSnapshotLevels {
     asks: Vec<(u128, Arc<PriceLevel>)>,
 }
 
-/// Guard over the submit gate (#209) in either mode — held for the length
-/// of one mutating entry-point call. Only the drop timing matters, hence
-/// the unused-field allowances.
+/// Guard over the submit gate (#209 / #225) in either mode — held for the
+/// length of one mutating entry-point call. Only the drop timing matters,
+/// hence the unused-field allowances.
+/// [`OrderBook::acquire_submit_gate`] is the single place that picks the
+/// mode and carries the full rationale.
 pub(super) enum SubmitGateGuard<'a> {
-    /// Shared mode: every non-FOK mutating entry point.
+    /// Shared mode: everything whose decision does not span two operations
+    /// — ordinary and post-only submits, `UpdateQuantity`, `Cancel`, every
+    /// modify on an `STPMode::None` book, cancels, mass cancels, expiry
+    /// eviction and anonymous match-only sweeps.
     Read(#[allow(dead_code)] std::sync::RwLockReadGuard<'a, ()>),
-    /// Exclusive mode: a fill-or-kill submit's feasibility + sweep window.
+    /// Exclusive mode: a fill-or-kill submit's feasibility + sweep window
+    /// (#209); an STP-relevant submit's per-level scan + fill window and
+    /// the matching-capable modifies (`UpdatePrice`,
+    /// `UpdatePriceAndQuantity`, `Replace`) that carry the same window
+    /// under STP; and the live snapshot restore commit (#225).
     Write(#[allow(dead_code)] std::sync::RwLockWriteGuard<'a, ()>),
 }
