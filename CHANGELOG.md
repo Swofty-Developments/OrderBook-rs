@@ -38,7 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ReplayError::OrderBookError` (`OrderSizeOutOfRange`,
   `QuantityOverflow`, `RiskMaxNotional`), because the requested size is
   now actually applied and the projected total is larger than the one the
-  original run evaluated.
+  original run evaluated. For the same reason `ReplayEngine::verify`
+  returns `Ok(false)` when such a journal is checked against a snapshot
+  captured by the pre-fix run: the replayed state is the corrected one.
 
 ## [0.12.0] — 2026-07-14
 
