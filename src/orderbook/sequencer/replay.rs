@@ -882,6 +882,17 @@ where
     /// engaged kill switch a rejected GTC would rest on replay, and a
     /// rejected IOC would consume liquidity the live book never touched.
     ///
+    /// `Other(0)` is the library's own bucket for errors that are not
+    /// public rejects. For a submit that is the clock-dependent
+    /// expired-at-admission `InvalidOperation`, which a replay clock cannot
+    /// be expected to reproduce, and the residual-rest `PriceLevelError`.
+    /// The latter is the one member that can in principle follow fills,
+    /// but the book pre-checks everything pricelevel validates on admission
+    /// (duplicate id, representability, price/side topology), so reaching
+    /// it is an invariant break that replay could not reproduce faithfully
+    /// either way; it is skipped with the rest of `Other` rather than making
+    /// every expired-order rejection abort replay.
+    ///
     /// `RejectReason` is `#[non_exhaustive]`; a named code this table does
     /// not list is re-executed, so a divergence surfaces as
     /// [`ReplayError::OutcomeMismatch`] rather than being skipped silently.
@@ -915,7 +926,12 @@ where
     /// `available` on `InsufficientLiquidity`, say): the journal carries
     /// the code, and a divergence confined to the details is a divergence
     /// in the book that the next dispatched command or a final
-    /// [`snapshots_match`] surfaces.
+    /// [`snapshots_match`] surfaces. The same holds for a
+    /// [`ReplayBookConfig`] that differs in a way the code cannot see — an
+    /// STP mode that cancels the maker where the live one did not, both
+    /// reporting `SelfTradePrevention`: matching the source book's
+    /// configuration is the caller's contract on every `*_with_config`
+    /// entry point, and [`ReplayEngine::verify`] is the check for it.
     fn reconcile_submit(
         event: &SequencerEvent<T>,
         recorded: Option<RejectReason>,

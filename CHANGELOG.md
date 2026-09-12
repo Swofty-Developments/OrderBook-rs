@@ -595,7 +595,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Rejected` keeps the historical skip and therefore the pre-existing gap
   (replay cannot tell a pure rejection from one that traded first without
   a code; producers close it by recording `RejectedWithCode`); only the
-  code is compared, not the error's details; and `MarketOrder` /
+  code is compared, not the error's details, so a replay config that
+  differs in a way the code cannot see (an STP mode that also cancels the
+  maker) is the caller's config contract and `ReplayEngine::verify`'s job
+  to catch, not reconciliation's; and `MarketOrder` /
   `MarketOrderByAmount` carry no user id, so a market order journaled
   after STP effects under a user re-executes through the STP-less path
   and a rejection recorded for it aborts with `OutcomeMismatch` rather
