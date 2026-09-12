@@ -601,7 +601,10 @@ where
                 order_id,
                 new_quantity,
             } => {
-                // A zero total is a removal, not a resize. pricelevel keeps a
+                // A zero `new_quantity` is a removal, not a resize (for a
+                // two-tranche order the field is the visible tranche, so the
+                // projected total may be nonzero; the whole order still
+                // goes, see below). pricelevel keeps a
                 // zero-quantity maker in its queue (`new_total <= live_total`
                 // ⇒ keep in place), so applying the update rested a maker at
                 // zero depth: it held `best_bid` / `best_ask` on a level with
