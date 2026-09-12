@@ -33,14 +33,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   point. The journal format is unchanged and
   `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` is **not** bumped; however, a
   journal recorded before this fix that contains a reserve
-  `UpdatePriceAndQuantity` may replay to a different (now correct) state,
-  or surface a validation / risk rejection as
-  `ReplayError::OrderBookError` (`OrderSizeOutOfRange`,
-  `QuantityOverflow`, `RiskMaxNotional`), because the requested size is
-  now actually applied and the projected total is larger than the one the
-  original run evaluated. For the same reason `ReplayEngine::verify`
-  returns `Ok(false)` when such a journal is checked against a snapshot
-  captured by the pre-fix run: the replayed state is the corrected one.
+  `UpdatePriceAndQuantity` may produce different historical results on
+  replay: the replayed book can differ from the one the original run
+  produced, and the update can surface a validation rejection as
+  `ReplayError::OrderBookError` (`QuantityOverflow`, or
+  `OrderSizeOutOfRange` when the `ReplayBookConfig` carries the original
+  size limits), because the requested size is now actually applied and
+  the projected total is larger than the one the original run evaluated.
+  Account risk limits are not part of `ReplayBookConfig`, so
+  `RiskMaxNotional` cannot arise on replay. For the same reason
+  `ReplayEngine::verify` returns `Ok(false)` when such a journal is
+  checked against a snapshot captured by the pre-fix run.
 
 ## [0.12.0] — 2026-07-14
 
