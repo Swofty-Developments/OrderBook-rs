@@ -129,10 +129,17 @@ println!("Average price: {}", result.average_price());
 - Consume liquidity from order book
 - May experience slippage
 
-**Iceberg Orders:**
-- Hide large orders by showing only visible portion
-- Replenish visible quantity as filled
+**Iceberg and Reserve Orders (two tranches):**
+- Hide large orders by showing only the visible tranche
+- Replenish the visible tranche as it is filled (Reserve orders carry an
+  explicit replenishment policy)
 - Reduce market impact
+- The tranches are independent and the order's total is `visible + hidden`.
+  The quantity supplied to these modification variants addresses the
+  **visible** tranche and leaves the hidden tranche untouched:
+  `OrderUpdate::UpdateQuantity`, `OrderUpdate::UpdatePriceAndQuantity` and
+  `OrderUpdate::Replace`. `add_iceberg_order` takes the visible and hidden
+  tranches as separate arguments
 
 **Time-In-Force:**
 - `Gtc` (Good-Till-Cancel): Remain until filled or cancelled
@@ -168,13 +175,13 @@ book.add_limit_order(
     None
 )?;
 
-// Iceberg order (visible: 10, total: 100)
+// Iceberg order (visible tranche: 10, hidden tranche: 90, total: 100)
 let order_id = OrderId::new();
 book.add_iceberg_order(
     order_id,
     50000,           // price
-    100,             // total quantity
     10,              // visible quantity
+    90,              // hidden quantity
     Side::Buy,
     TimeInForce::Gtc,
     None
@@ -189,6 +196,52 @@ book.add_market_order(
     None
 )?;
 ```
+
+### Modifying Orders
+
+Modifications go through `OrderBook::update_order` with an `OrderUpdate`
+variant:
+
+```rust
+use pricelevel::{OrderUpdate, Price, Quantity};
+
+// Resize in place
+book.update_order(OrderUpdate::UpdateQuantity {
+    order_id,
+    new_quantity: Quantity::new(80),
+})?;
+
+// Re-price only
+book.update_order(OrderUpdate::UpdatePrice {
+    order_id,
+    new_price: Price::new(50100),
+})?;
+
+// Re-price and resize in one call
+book.update_order(OrderUpdate::UpdatePriceAndQuantity {
+    order_id,
+    new_price: Price::new(50100),
+    new_quantity: Quantity::new(80),
+})?;
+```
+
+**Queue priority:** `UpdateQuantity` keeps the order's queue position when the
+new size is unchanged or smaller, and moves it to the back of its price level
+when the size grows. `UpdatePrice`, `UpdatePriceAndQuantity` and `Replace` are
+cancel-then-add: the order always re-enters at the back of its (possibly new)
+price level. `Replace` and `UpdatePriceAndQuantity` do so even when the price
+is unchanged; `UpdatePrice` to the current price is rejected instead.
+
+**Two-tranche orders (iceberg / reserve):** the quantity carried by
+`UpdateQuantity`, `UpdatePriceAndQuantity` and `Replace` sets the **visible**
+tranche and leaves the hidden tranche untouched, so the resulting total is
+`new_quantity + hidden`; an increase is applied, not clamped. Reducing the
+hidden tranche is not reachable through an update: cancel and re-submit
+instead. Shape validation (tick size, lot size, `visible + hidden`
+representability) and the risk gate run on the projected order, and the
+min / max order size limits apply to its `visible + hidden` total, so an
+update can be rejected for a size larger than the quantity you passed.
+These pre-admission rejections leave the original order unchanged.
 
 ### Cancelling Orders
 

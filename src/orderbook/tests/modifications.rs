@@ -227,6 +227,7 @@ mod test_order_modifications {
 #[cfg(test)]
 mod test_modifications_remaining {
     use crate::OrderBook;
+    use crate::orderbook::modifications::OrderQuantity;
 
     use pricelevel::{
         Hash32, Id, OrderType, OrderUpdate, PegReferenceType, Price, Quantity, Side, TimeInForce,
@@ -394,6 +395,39 @@ mod test_modifications_remaining {
         assert!(order2.is_some());
         assert!(order3.is_some());
         assert!(order4.is_some());
+
+        // Single-tranche kinds take the new quantity outright.
+        let Some(OrderType::TrailingStop { quantity, .. }) = order1.as_deref() else {
+            panic!("expected a trailing stop order after the update");
+        };
+        assert_eq!(quantity.as_u64(), 15);
+
+        let Some(OrderType::PeggedOrder { quantity, .. }) = order2.as_deref() else {
+            panic!("expected a pegged order after the update");
+        };
+        assert_eq!(quantity.as_u64(), 15);
+
+        let Some(OrderType::MarketToLimit { quantity, .. }) = order3.as_deref() else {
+            panic!("expected a market-to-limit order after the update");
+        };
+        assert_eq!(quantity.as_u64(), 15);
+
+        // The reserve order takes the new quantity as its visible tranche
+        // and keeps the hidden tranche untouched (#221).
+        let Some(reserve) = order4.as_deref() else {
+            panic!("expected a reserve order after the update");
+        };
+        assert_eq!(reserve.total_quantity(), 20);
+        let OrderType::ReserveOrder {
+            visible_quantity,
+            hidden_quantity,
+            ..
+        } = reserve
+        else {
+            panic!("expected a reserve order after the update");
+        };
+        assert_eq!(visible_quantity.as_u64(), 15);
+        assert_eq!(hidden_quantity.as_u64(), 5);
 
         assert_eq!(order1.unwrap().price().as_u128(), 1010);
         assert_eq!(order2.unwrap().price().as_u128(), 1010);
@@ -760,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_quantity_for_reserve_order() {
+    fn test_set_total_remaining_for_reserve_order_replenishes_visible_and_conserves_total() {
         let mut order = OrderType::ReserveOrder {
             id: Id::new(),
             side: Side::Buy,
@@ -777,7 +811,7 @@ mod tests {
         };
 
         // Simulate a partial fill of 15 units
-        order.set_quantity(85); // 100 - 15 = 85
+        order.set_total_remaining(85); // 100 - 15 = 85
 
         // After the fill, the visible part is consumed and then immediately replenished.
         assert_eq!(order.quantity(), 10); // The visible quantity is replenished to 10.
@@ -793,6 +827,88 @@ mod tests {
             assert_eq!(visible_quantity, Quantity::new(10));
             assert_eq!(hidden_quantity, Quantity::new(75));
         }
+    }
+
+    /// Build a reserve order with the given tranche split (#221 fixtures).
+    fn reserve_order(visible: u64, hidden: u64) -> OrderType<()> {
+        OrderType::ReserveOrder {
+            id: Id::new(),
+            side: Side::Buy,
+            price: Price::new(100),
+            visible_quantity: Quantity::new(visible),
+            hidden_quantity: Quantity::new(hidden),
+            replenish_amount: std::num::NonZeroU64::new(10),
+            auto_replenish: true,
+            replenish_threshold: Quantity::new(0),
+            user_id: Hash32::zero(),
+            time_in_force: TimeInForce::Gtc,
+            timestamp: TimestampMs::new(0),
+            extra_fields: (),
+        }
+    }
+
+    /// Assert the tranche split of a reserve order.
+    fn assert_reserve_split(order: &OrderType<()>, visible: u64, hidden: u64) {
+        let OrderType::ReserveOrder {
+            visible_quantity,
+            hidden_quantity,
+            ..
+        } = order
+        else {
+            panic!("expected a reserve order");
+        };
+        assert_eq!(visible_quantity.as_u64(), visible);
+        assert_eq!(hidden_quantity.as_u64(), hidden);
+    }
+
+    #[test]
+    fn test_set_quantity_for_reserve_order_sets_visible_and_keeps_hidden() {
+        // An increase is honoured: it used to be silently dropped (#221).
+        let mut increased = reserve_order(5, 5);
+        increased.set_quantity(15);
+        assert_reserve_split(&increased, 15, 5);
+        assert_eq!(increased.total_quantity(), 20);
+
+        // A decrease sets the visible tranche; hidden is untouched.
+        let mut decreased = reserve_order(30, 70);
+        decreased.set_quantity(10);
+        assert_reserve_split(&decreased, 10, 70);
+
+        // The issue's amplified case: 80 is the new visible tranche, not a
+        // 100 -> 80 total reduction.
+        let mut amplified = reserve_order(30, 70);
+        amplified.set_quantity(80);
+        assert_reserve_split(&amplified, 80, 70);
+        assert_eq!(amplified.total_quantity(), 150);
+    }
+
+    #[test]
+    fn test_set_quantity_for_iceberg_order_sets_visible_and_keeps_hidden() {
+        let mut order = OrderType::IcebergOrder {
+            id: Id::new(),
+            side: Side::Buy,
+            price: Price::new(100),
+            visible_quantity: Quantity::new(5),
+            hidden_quantity: Quantity::new(5),
+            user_id: Hash32::zero(),
+            time_in_force: TimeInForce::Gtc,
+            timestamp: TimestampMs::new(0),
+            extra_fields: (),
+        };
+
+        order.set_quantity(15);
+
+        let OrderType::IcebergOrder {
+            visible_quantity,
+            hidden_quantity,
+            ..
+        } = &order
+        else {
+            panic!("expected an iceberg order");
+        };
+        assert_eq!(visible_quantity.as_u64(), 15);
+        assert_eq!(hidden_quantity.as_u64(), 5);
+        assert_eq!(order.total_quantity(), 20);
     }
 }
 

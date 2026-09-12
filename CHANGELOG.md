@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Reserve `UpdatePriceAndQuantity` honours the requested visible quantity
+  (#221).** `OrderQuantity::set_quantity` read a `ReserveOrder`'s argument
+  as a **total** target and only ever reduced: a requested increase was
+  silently ignored (the order kept its previous size while the call
+  reported success) and a decrease was drawn total-wise across both
+  tranches, visible first and then hidden with replenish-on-empty. The
+  single production caller is the `OrderUpdate::UpdatePriceAndQuantity`
+  arm of `OrderBook::update_order`, so a reserve re-price plus re-size
+  landed on a size nobody asked for; amplified case: a 30 visible / 70
+  hidden reserve asked to move to 80 ended at 10 / 70 instead of 80 / 70.
+  `set_quantity` now sets the **visible** tranche and leaves hidden
+  untouched for both two-tranche kinds, so the new total is
+  `new_quantity + hidden`. That matches `OrderUpdate::UpdateQuantity`,
+  `OrderUpdate::Replace`, the iceberg arm of the same method and the
+  upstream `pricelevel` contract (`OrderType::with_reduced_quantity`),
+  which all treat the submitted quantity as the display size.
+
+  Compatibility: no signature changes, but `OrderQuantity` is public, so
+  the observable behaviour of `set_quantity` on a `ReserveOrder` changes
+  for direct callers. `OrderQuantity::set_total_remaining` (the #210
+  residual resting path) is unchanged and remains the total-target entry
+  point. The journal format is unchanged and
+  `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` is **not** bumped; however, a
+  journal recorded before this fix that contains a reserve
+  `UpdatePriceAndQuantity` may produce different historical results on
+  replay: the replayed book can differ from the one the original run
+  produced, and the update can surface a validation rejection as
+  `ReplayError::OrderBookError` (`QuantityOverflow`, or
+  `OrderSizeOutOfRange` when the `ReplayBookConfig` carries the original
+  size limits), because the requested size is now actually applied and
+  the projected total is larger than the one the original run evaluated.
+  Account risk limits are not part of `ReplayBookConfig`, so
+  `RiskMaxNotional` cannot arise on replay. `ReplayEngine::verify` on
+  such a journal may return `Ok(false)` when the replay succeeds and the
+  resulting snapshot differs from the one captured by the pre-fix run,
+  or propagate the replay error when the re-executed update is rejected.
+
 ## [0.12.0] — 2026-07-14
 
 ### Changed (breaking, semver-minor under 0.x)
