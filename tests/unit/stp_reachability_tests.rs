@@ -7,14 +7,15 @@
 //! residual can fund another lot at the level: a spent budget is a complete
 //! fill, and quote-amount dust below one unit leaves the maker untouched
 //! and walks on to the next level, where a cheaper bid may still be
-//! affordable.
+//! affordable. `check_modify_stp_self_cross` applies the same per-level
+//! FIFO rule on the modify path.
 
 #[cfg(test)]
 mod tests_stp_reachability {
     use orderbook_rs::orderbook::order_state::{CancelReason, OrderStateTracker, OrderStatus};
     use orderbook_rs::orderbook::stp::STPMode;
     use orderbook_rs::{DefaultOrderBook, OrderBook, OrderBookError, TradeResult};
-    use pricelevel::{Hash32, Id, MatchResult, Side, TimeInForce};
+    use pricelevel::{Hash32, Id, MatchResult, OrderUpdate, Price, Side, TimeInForce};
 
     const PRICE: u128 = 100;
     /// Ahead in the queue and owned by someone else: reachable depth.
@@ -408,6 +409,136 @@ mod tests_stp_reachability {
                 ),
                 "{mode}: no cancel recorded for an unreachable maker"
             );
+        }
+    }
+
+    /// The modify precheck applies the same per-level rule: a bid repriced
+    /// into a level whose non-self depth covers it is admitted, fills, and
+    /// never touches the same-user maker behind that depth. Before, any
+    /// same-user order at the level rejected the reprice outright.
+    #[test]
+    fn repricing_into_covered_same_level_depth_is_admitted() {
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let book = book_with_self_maker_behind(mode);
+            book.add_limit_order_with_user(
+                Id::from_u64(TAKER),
+                90,
+                3,
+                Side::Buy,
+                TimeInForce::Gtc,
+                user(1),
+                None,
+            )
+            .expect("rest the bid below the market");
+
+            book.update_order(OrderUpdate::UpdatePrice {
+                order_id: Id::from_u64(TAKER),
+                new_price: Price::new(PRICE),
+            })
+            .unwrap_or_else(|e| panic!("{mode}: covered by the non-self depth, got {e:?}"))
+            .unwrap_or_else(|| panic!("{mode}: the repriced order was found"));
+
+            assert!(
+                book.get_order(Id::from_u64(TAKER)).is_none(),
+                "{mode}: the repriced bid filled completely"
+            );
+            assert_eq!(
+                book.get_order(Id::from_u64(OTHER_MAKER))
+                    .unwrap_or_else(|| panic!("{mode}: the non-self maker still rests"))
+                    .visible_quantity()
+                    .as_u64(),
+                2,
+                "{mode}: filled against the non-self maker"
+            );
+            assert_self_maker_intact(&book);
+        }
+    }
+
+    /// And a reprice the non-self depth cannot cover is still refused
+    /// before the original is cancelled, so the original survives.
+    #[test]
+    fn repricing_past_same_level_depth_is_refused_before_cancel() {
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let book = book_with_self_maker_behind(mode);
+            book.add_limit_order_with_user(
+                Id::from_u64(TAKER),
+                90,
+                7,
+                Side::Buy,
+                TimeInForce::Gtc,
+                user(1),
+                None,
+            )
+            .expect("rest the bid below the market");
+
+            let err = book
+                .update_order(OrderUpdate::UpdatePrice {
+                    order_id: Id::from_u64(TAKER),
+                    new_price: Price::new(PRICE),
+                })
+                .expect_err("7 outruns the 5 non-self lots and reaches the same-user maker");
+            assert!(
+                matches!(err, OrderBookError::SelfTradePrevented { .. }),
+                "{mode}: expected SelfTradePrevented, got {err:?}"
+            );
+
+            let original = book
+                .get_order(Id::from_u64(TAKER))
+                .unwrap_or_else(|| panic!("{mode}: the original survives a refused reprice"));
+            assert_eq!(original.price().as_u128(), 90);
+            assert_eq!(original.visible_quantity().as_u64(), 7);
+            assert_eq!(
+                book.get_order(Id::from_u64(OTHER_MAKER))
+                    .unwrap_or_else(|| panic!("{mode}: nothing traded"))
+                    .visible_quantity()
+                    .as_u64(),
+                5
+            );
+            assert_self_maker_intact(&book);
+        }
+    }
+
+    /// Unchanged behaviour: a taker with quantity left over after the
+    /// non-self depth does reach the same-user maker and is cancelled.
+    #[test]
+    fn reachable_self_maker_reports_self_trade_prevented() {
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let book = book_with_self_maker_behind(mode);
+
+            let err = book
+                .add_limit_order_with_user(
+                    Id::from_u64(TAKER),
+                    PRICE,
+                    7,
+                    Side::Buy,
+                    TimeInForce::Gtc,
+                    user(1),
+                    None,
+                )
+                .expect_err("reachable self-trade is prevented");
+            assert!(
+                matches!(err, OrderBookError::SelfTradePrevented { .. }),
+                "{mode}: expected SelfTradePrevented, got {err:?}"
+            );
+            assert_eq!(
+                book.order_status(Id::from_u64(TAKER)),
+                Some(OrderStatus::Cancelled {
+                    filled_quantity: 5,
+                    reason: CancelReason::SelfTradePrevention,
+                }),
+                "{mode}: taker cancelled with its true non-self fill"
+            );
+
+            match mode {
+                STPMode::CancelBoth => assert!(
+                    book.get_order(Id::from_u64(SELF_MAKER)).is_none(),
+                    "CancelBoth cancels the reached maker"
+                ),
+                _ => assert!(
+                    book.get_order(Id::from_u64(SELF_MAKER)).is_some(),
+                    "CancelTaker leaves the maker resting"
+                ),
+            }
         }
     }
 }
