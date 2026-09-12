@@ -468,18 +468,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event, leaking its `order_locations` entry — `cancel_order` then
   returned `Ok(None)` while re-adding the id reported `DuplicateOrderId`,
   and the tracked status stayed `Open` forever. The arm now routes to the
-  same `UserRequested` cancel that `OrderUpdate::Cancel` performs, so the
-  level-change event, the `Cancelled { UserRequested }` transition, the
-  per-account risk release, the location / user-index untrack and the
-  empty-level removal happen in lockstep. **Contract:** zero is a removal,
-  not a resize. It cancels the *entire* order, hidden depth of an iceberg
-  or reserve order included (a nonzero `new_quantity` still resizes only
-  the visible tranche), and it bypasses the projected-order validator and
-  the modify-aware risk check, so a configured `min_order_size` no longer
+  same `UserRequested` cancel that `OrderBook::cancel_order` performs
+  (`cancel_order_with_reason`), so the level-change event, the
+  `Cancelled { UserRequested }` transition, the per-account risk release,
+  the location / user-index untrack and the empty-level removal happen in
+  lockstep. **Contract:** a zero requested quantity is a removal, not a
+  resize. It cancels the *entire* order, hidden depth of an iceberg or
+  reserve order included (a nonzero `new_quantity` still resizes only the
+  visible tranche), and it bypasses the projected-order validator and the
+  modify-aware risk check, so a configured `min_order_size` no longer
   rejects it with `OrderSizeOutOfRange`. The kill switch still refuses it,
-  as it refuses every modify. Pinned for plain, iceberg and reserve makers,
-  a `min_order_size` book, a shared level, an absent id and an engaged
-  kill switch.
+  as it refuses every modify. The removal semantic is `UpdateQuantity`'s
+  alone: a zero quantity on `Replace` / `UpdatePriceAndQuantity` re-adds
+  through validate-first and, for a two-tranche order, zeroes the visible
+  tranche while the hidden depth stays live. Pinned for plain, iceberg and
+  reserve makers, a `min_order_size` book, a shared level, an absent id and
+  an engaged kill switch.
 
 - **Reserve `UpdatePriceAndQuantity` honours the requested visible quantity
   (#221).** `OrderQuantity::set_quantity` read a `ReserveOrder`'s argument

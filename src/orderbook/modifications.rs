@@ -430,9 +430,15 @@ where
     /// A **zero** `UpdateQuantity` is a removal and runs none of that:
     /// it bypasses the projected shape validator and the modify-aware
     /// risk check entirely, so neither a configured `min_order_size` nor
-    /// a risk limit vetoes it, and takes the same cancel path as
-    /// [`OrderUpdate::Cancel`]. Only the kill-switch check above still
-    /// applies to it, because it is submitted as a modify.
+    /// a risk limit vetoes it, and it runs the same cancel
+    /// [`OrderBook::cancel_order`] performs (`cancel_order_with_reason`
+    /// with `UserRequested`). Only the kill-switch check above still
+    /// applies to it, because it is submitted as a modify. This removal
+    /// semantic belongs to `UpdateQuantity` alone: a zero quantity on
+    /// [`OrderUpdate::Replace`] or [`OrderUpdate::UpdatePriceAndQuantity`]
+    /// re-adds the order through validate-first and, for a two-tranche
+    /// order, sets the visible tranche to zero while the hidden depth
+    /// stays live.
     ///
     /// The three cancel-then-add variants additionally run two pre-checks
     /// on the projected order, both **before** the original is cancelled so
@@ -601,29 +607,31 @@ where
                 order_id,
                 new_quantity,
             } => {
-                // A zero `new_quantity` is a removal, not a resize (for a
-                // two-tranche order the field is the visible tranche, so the
-                // projected total may be nonzero; the whole order still
-                // goes, see below). pricelevel keeps a
-                // zero-quantity maker in its queue (`new_total <= live_total`
+                // A zero requested quantity is a removal, not a resize. For
+                // a one-tranche order zero is also a zero total: pricelevel
+                // keeps such a maker in its queue (`new_total <= live_total`
                 // ⇒ keep in place), so applying the update rested a maker at
-                // zero depth: it held `best_bid` / `best_ask` on a level with
-                // nothing to fill, made `will_cross_market` reject a post-only
-                // at that price, and was eventually dropped by a sweep with no
-                // trade and no cancel event, leaking its `order_locations`
-                // entry (`cancel_order` then returned `Ok(None)` while a
-                // re-add of the id reported `DuplicateOrderId`). Cancel it
-                // instead — the same removal `OrderUpdate::Cancel` performs.
-                // `Replace` / `UpdatePriceAndQuantity` with a zero quantity
-                // also end with the original gone, but only after their
-                // validate-first checks pass; this branch runs no validator
-                // at all (a removal has no shape to validate), so a
-                // configured `min_order_size` cannot veto it and the raw
-                // `new_quantity` is read here rather than a projected
-                // total: for an iceberg / reserve order that field is the
-                // visible tranche, and zero cancels the whole order, hidden
-                // depth included. Ungated: `update_order` holds the submit
-                // gate (#209 / #225).
+                // zero depth that held `best_bid` / `best_ask` on a level
+                // with nothing to fill, made `will_cross_market` reject a
+                // post-only at that price, and was eventually dropped by a
+                // sweep with no trade and no cancel event, leaking its
+                // `order_locations` entry (`cancel_order` then returned
+                // `Ok(None)` while a re-add of the id reported
+                // `DuplicateOrderId`). For an iceberg / reserve order the
+                // field is the visible tranche, so the projected total may
+                // be nonzero and the hidden depth would keep filling; zero
+                // still cancels the whole order by contract, hidden depth
+                // included. Cancel through `cancel_order_with_reason`, the
+                // removal `OrderBook::cancel_order` performs (not the
+                // `OrderUpdate::Cancel` arm below, which is a separate
+                // implementation). This branch runs no validator at all — a
+                // removal has no shape to validate — so a configured
+                // `min_order_size` cannot veto it. Only `UpdateQuantity` has
+                // this removal semantic: `Replace` / `UpdatePriceAndQuantity`
+                // with a zero quantity re-add the order through
+                // validate-first, and for a two-tranche order they set the
+                // visible tranche to zero and leave the hidden depth live.
+                // Ungated: `update_order` holds the submit gate (#209 / #225).
                 if new_quantity.as_u64() == 0 {
                     return self.cancel_order_with_reason(order_id, CancelReason::UserRequested);
                 }
