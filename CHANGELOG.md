@@ -75,6 +75,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Self-trade prevention fires only on a same-user maker the taker can
+  reach (#222).** `check_stp_at_level` reports a conflict whenever a
+  same-user maker rests at a crossed level, and the `CancelTaker` /
+  `CancelBoth` arms then cancelled the taker (and, under `CancelBoth`, the
+  maker) unconditionally after their safe-quantity pre-match. A taker the
+  non-self depth ahead of that maker already satisfied therefore returned
+  `SelfTradePrevented` with `Cancelled { filled_quantity: n }` — a client
+  that retried double-filled — and `CancelBoth` destroyed a maker the
+  sweep never touched; market takers reach the same arms through
+  `match_order_with_user`, which drops the taker flag, so the caller saw
+  `Ok` while the maker was gone. The arms now cancel only when the sweep
+  can still execute into the same-user maker, with two guards: a budget
+  the pre-match exhausted (`is_done()`) is an ordinary complete fill, and
+  a residual that cannot fund one more lot at the level's price
+  (`level_qty_cap == 0` — the quote-amount case, since a notional budget
+  normally ends in dust below one unit rather than at exactly zero, and
+  the lot-rounded case) leaves the maker untouched and walks on to the
+  next level instead of breaking, because a quote-amount sell can still
+  afford a whole lot at a cheaper bid further down. The modify precheck
+  `check_modify_stp_self_cross` (#168) rejected a reprice as soon as any
+  same-user order rested at a crossed level, before subtracting the
+  non-self depth queued ahead of it; it now consults the same
+  insertion-sequence `check_stp_at_level` verdict the sweep uses, so a
+  reprice the non-self depth covers is admitted and one it does not
+  cover is still refused before the original is cancelled. Pinned for
+  base-quantity, fill-or-kill and market takers, quote-amount buys (dust
+  and reachable), a quote-amount sell past an unaffordable self level, a
+  lot-rounded residual, the exact-depth boundary, and same-level reprices
+  (admitted and refused); a reachable maker still yields
+  `SelfTradePrevented` with the true non-self fill.
+
 - **A reserve residual follows `auto_replenish` (#230).**
   `reduce_reserve_to_total` — the residual-resting helper behind
   `OrderQuantity::set_total_remaining`, which `add_order` uses to distribute
