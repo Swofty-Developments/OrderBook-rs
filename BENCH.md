@@ -393,98 +393,191 @@ follow-up; the book-level gate is the correctness fix.
 
 ### `reserve_sweep` — IOC probes into reserve makers, strandable vs replenishing (added for #230)
 
-`reserve_sweep_hdr` measures `capture_strandable_makers` (#230). Each
-sweep in `match_order_inner` reads `non_auto_reserve_rested` (a
-monotonic per-book flag set at admission) exactly once, before any
-level is touched. On a book that has never rested a
-non-auto-replenishing `ReserveOrder` with hidden depth, that single
-relaxed atomic load is the sweep's entire cost: no pool buffer is
-acquired, `capture_strandable_makers` is never called for any level,
-and the post-sweep drain does no lookup. Only when the flag is true
-does each matched level get checked, and, if it still holds hidden
-depth, walked with `PriceLevel::iter_orders()` to record which resting
-non-auto reserves have hidden quantity behind them, so a sweep can
-report the hidden depth it strands when `pricelevel` drops a depleted
-maker's hidden tranche instead of refreshing it. `iter_orders` is
-`DashMap::iter` upstream, which read-locks every shard of the map
+`reserve_sweep_hdr` measures `capture_strandable_makers` (#230) and
+`strandable_makers_resting`, an exact `AtomicUsize` count of currently
+resting non-auto-replenishing `ReserveOrder`s with hidden depth:
+incremented on admission and on snapshot restore, decremented on
+cancel, mass cancel, expiry, STP removal and fill. Each sweep in
+`match_order_inner` reads the count once, before any level is touched.
+On a book where it reads zero, that single relaxed atomic load is the
+sweep's entire cost: no pool buffer is acquired,
+`capture_strandable_makers` is never called for any level, and the
+post-sweep drain does no lookup. While the count is greater than zero,
+every matching-capable submit and every cancel-then-add re-price runs
+under the exclusive submit gate instead of the shared side, and
+admitting a new strandable reserve is itself always exclusive, in
+every `STPMode`, so no strandable maker can be admitted, cancelled or
+replaced while a sweep is capturing against the count it read; that is
+what keeps a sweep's capture attribution exact. Only when the count is
+positive does each matched level get checked, and, if it still holds
+hidden depth, walked with `PriceLevel::iter_orders()` to record which
+resting non-auto reserves have hidden quantity behind them, so a sweep
+can report the hidden depth it strands when `pricelevel` drops a
+depleted maker's hidden tranche instead of refreshing it. `iter_orders`
+is `DashMap::iter` upstream, which read-locks every shard of the map
 regardless of how few orders rest at the level, so the walk is not
-free on any level holding hidden depth.
+free on any level holding hidden depth. `main` has none of this
+machinery at all, so on `main` every scenario below is just its plain
+matching workload.
 
 Same book geometry as `thin_book_sweep`: 3 resting asks refilled every
 5 ops (not timed), 200 000 IOC buy probes with qty `1..=20` against
 them. The only difference from `thin_book_sweep` is that the resting
 side is `OrderType::ReserveOrder` (visible `1..=5`, hidden `4..=12`,
-`replenish_threshold: 0`) instead of plain limits. Two scenarios, run
+`replenish_threshold: 0`) instead of plain limits. Five scenarios, run
 back to back on fresh books:
 
 - `reserve_sweep_nonauto` (`auto_replenish: false`): every resting
-  maker is strandable, so `non_auto_reserve_rested` flips true on the
-  first rest and every level-match that still holds hidden depth pays
-  the `iter_orders()` walk. This is the scenario `capture_strandable_makers`
-  adds cost to.
+  maker is strandable, so the gate opens on the first rest and every
+  level-match that still holds hidden depth pays the `iter_orders()`
+  walk. This is the scenario `capture_strandable_makers` adds cost to.
 - `reserve_sweep_auto` (`auto_replenish: true`): hidden depth still
   rests and is still consumed, but nothing is strandable, so this book
-  never sets `non_auto_reserve_rested`. Each sweep pays the one hoisted
-  atomic load and nothing else; `capture_strandable_makers` is never
-  called.
+  never opens the gate. Each sweep pays the one gate load and nothing
+  else; `capture_strandable_makers` is never called.
+- `reserve_sweep_dense_nonauto`: one price level (100) holding 64
+  non-auto reserve makers (visible `1..=2`, hidden `4..=12`), refilled
+  back to 64 whenever the level is fully consumed (not timed). IOC buy
+  probes qty `16..=96`, large enough that one probe routinely strands
+  several makers from that single level in one sweep. Isolates the
+  capture pass over a dense level and the post-sweep drain, which
+  looks up every filled maker against the captured list; both scale
+  with how many makers a single probe strands, not with how many
+  levels a sweep visits.
+- `reserve_sweep_mixed_armed`: one non-auto reserve (10 visible, 20
+  hidden) rests once at admission, far above every probe price, so it
+  is never touched and the gate stays open for the whole run. The rest
+  of the book runs the `thin_book_sweep` geometry with `IcebergOrder`
+  resting makers in place of `ReserveOrder` ones. An iceberg holds
+  hidden depth but can never match `capture_strandable_makers`'s
+  `ReserveOrder` pattern, so every sweep pays the `iter_orders()` walk
+  on a level holding hidden depth without ever finding anything
+  strandable there: the pure cost of an open gate on levels that were
+  never going to report anything. Because `main` has no gate at all,
+  `reserve_sweep_mixed_armed` on `main` is just the iceberg-maker
+  version of `thin_book_sweep`, with no armed order and no walk.
+- `reserve_sweep_mixed_disarmed`: identical setup to
+  `reserve_sweep_mixed_armed`, except the arming maker is cancelled
+  right after resting, before the first probe. The cancel decrements
+  `strandable_makers_resting` back to zero, closing the gate before the
+  measured loop starts, so every sweep for the rest of the run pays
+  the same single relaxed atomic load as `reserve_sweep_auto` and
+  never calls `capture_strandable_makers`. This is the case the
+  maintainer asked to be exercised, since leaving a maker resting at a
+  distant price, as `reserve_sweep_mixed_armed` does, never closes the
+  gate at all.
 
 **`reserve_sweep_nonauto`** (`auto_replenish: false`; every resting
 maker is strandable, so the capture runs on the branch):
 
 | Quantile | `main` (no #230) | branch (#230) |
 |---|---|---|
-| p50    | 83 ns | 83 ns |
-| p99    | 4 543 ns | 6 959 ns |
-| p99.9  | 6 503 ns | 9 543 ns |
-| p99.99 | 8 711 ns | 11 839 ns |
+| p50    | 83 ns [83..83] | 83 ns [83..83] |
+| p99    | 4 335 ns [4 001..6 167] | 7 043 ns [5 711..8 711] |
+| p99.9  | 5 711 ns [5 003..29 759] | 10 295 ns [8 295..20 127] |
+| p99.99 | 12 543 ns [6 087..79 423] | 21 583 ns [11 255..40 191] |
 
 **`reserve_sweep_auto`** (`auto_replenish: true`; hidden depth rests
-but nothing is strandable, so the branch never arms
-`non_auto_reserve_rested`):
+but nothing is strandable, so `strandable_makers_resting` stays zero):
 
 | Quantile | `main` (no #230) | branch (#230) |
 |---|---|---|
-| p50    | 917 ns | 916 ns |
-| p99    | 3 917 ns | 3 793 ns |
-| p99.9  | 5 335 ns | 5 127 ns |
-| p99.99 | 6 503 ns | 6 211 ns |
+| p50    | 833 ns [666..1 166] | 958 ns [708..959] |
+| p99    | 3 793 ns [3 541..12 375] | 3 917 ns [3 541..4 583] |
+| p99.9  | 5 503 ns [4 543..32 175] | 5 419 ns [4 711..8 543] |
+| p99.99 | 13 503 ns [6 167..92 799] | 14 591 ns [6 459..21 135] |
 
-Medians of three runs per side, runs interleaved base/branch, `main`
-at `b821df2` (`orderbook-rs` 0.12.1) against this branch
-(`orderbook-rs` 0.13.0), both on `pricelevel` 0.9.1 with `Cargo.lock`
-aligned. Host: Apple M-series, 16 cores, macOS Darwin 25.6.0, `arm64`,
-rustc stable, 200 000 probes per scenario per run. Run-to-run spread
-was negligible at p50 and widened toward the tail on both `main` and
-the branch alike (p99.99 on either side roughly doubled between its
-lowest and highest of the three runs), consistent with ordinary
-single-sample tail jitter at 200 000 probes rather than anything
-specific to this comparison.
+**`reserve_sweep_dense_nonauto`** (one level, 64 non-auto reserve
+makers, probes `16..=96`):
+
+| Quantile | `main` (no #230) | branch (#230) |
+|---|---|---|
+| p50    | 21 375 ns [8 295..24 879] | 15 127 ns [12 047..27 967] |
+| p99    | 56 543 ns [22 127..158 079] | 37 151 ns [30 047..70 783] |
+| p99.9  | 68 223 ns [40 127..1 936 383] | 64 319 ns [41 631..80 127] |
+| p99.99 | 110 271 ns [88 063..36 143 103] | 106 303 ns [73 343..221 567] |
+
+**`reserve_sweep_mixed_armed`** (one strandable maker rests at
+`ARMING_PRICE` for the whole run; icebergs at `99..=101` do the
+matching):
+
+| Quantile | `main` (no #230) | branch (#230) |
+|---|---|---|
+| p50    | 1 167 ns [958..1 375] | 1 167 ns [1 000..1 334] |
+| p99    | 6 003 ns [4 875..6 627] | 5 751 ns [5 083..6 751] |
+| p99.9  | 8 543 ns [7 335..14 671] | 7 795 ns [6 627..20 015] |
+| p99.99 | 21 375 ns [9 335..510 719] | 21 135 ns [10 295..140 159] |
+
+**`reserve_sweep_mixed_disarmed`** (same setup, but the arming maker
+is cancelled before the first probe):
+
+| Quantile | `main` (no #230) | branch (#230) |
+|---|---|---|
+| p50    | 1 166 ns [959..1 417] | 1 167 ns [958..1 416] |
+| p99    | 5 711 ns [4 959..7 003] | 5 835 ns [4 751..6 711] |
+| p99.9  | 8 215 ns [6 751..11 463] | 8 127 ns [6 127..11 007] |
+| p99.99 | 22 047 ns [7 875..54 975] | 20 719 ns [9 255..38 815] |
+
+Medians of nine interleaved runs per side, `main` at `b821df2`
+(`orderbook-rs` 0.12.1) against this branch (`orderbook-rs` 0.13.0),
+both on `pricelevel` 0.9.1 with `Cargo.lock` aligned, same host and
+method as the rest of this document; full run range in brackets. p50
+on the microsecond-range scenarios (`reserve_sweep_auto`,
+`reserve_sweep_dense_nonauto`, `reserve_sweep_mixed_armed`,
+`reserve_sweep_mixed_disarmed`) is bimodal run to run on this host: 12
+performance cores plus 4 efficiency cores, and a single-threaded run
+lands on either core type, so its per-op cost shifts with it. That is
+why nine runs are reported here instead of three, why medians carry
+their full range instead of a single figure, and why no single-run
+number is quoted for these scenarios. `reserve_sweep_dense_nonauto`'s
+`main` range additionally has two extreme single-sample outliers, one
+run's p99.9 at 1.9 ms and another's p99.99 at 36.1 ms against medians
+in the tens of microseconds; that is one worst sample in nine runs of
+200 000 probes each, consistent with ordinary host scheduling jitter
+on a dense, many-order level, not a systematic effect.
 
 **What the comparison shows.** In `reserve_sweep_nonauto`, where the
-capture runs, the branch adds roughly 2.4 µs at p99 (4 543 ns →
-6 959 ns) and roughly 3 µs at p99.9 (6 503 ns → 9 543 ns) over `main`
-on this workload: every probe that matches a level holding hidden
-depth pays a shard-locked `DashMap` pass over that level's resting
-orders, and `iter_orders` read-locks every shard regardless of how few
-orders rest there. In `reserve_sweep_auto`, where the flag never arms,
-`main` and the branch are unchanged within run-to-run noise, exactly
-as intended: the guard confines its cost to books that can actually
-strand something. p50 is unchanged between `main` and the branch in
-both scenarios, because most probes in this thin, frequently-refilled
-book either find nothing resting or take the cheap early-exit path
-before any level walk would matter.
+capture runs, the branch adds roughly 2.7 µs at p99 (4 335 ns →
+7 043 ns) and roughly 4.6 µs at p99.9 (5 711 ns → 10 295 ns) over
+`main`: on a book holding strandable makers, every matching-capable
+submit now runs under the exclusive submit gate in addition to paying
+the shard-locked `DashMap` capture pass, and `iter_orders` read-locks
+every shard regardless of how few orders rest there. `reserve_sweep_auto`,
+`reserve_sweep_mixed_armed` and `reserve_sweep_mixed_disarmed` are all
+unchanged between `main` and the branch within their run-to-run range:
+`auto` never rests a strandable maker, so the count stays zero
+throughout; `mixed_disarmed` cancels its one strandable maker before
+the first probe, confirming the count closes the gate again once the
+last strandable maker is gone; `mixed_armed` keeps its one maker
+resting for the whole run, so the branch pays the walk on every
+iceberg level throughout, but that cost does not separate from
+`main`'s no-gate baseline at this sample size. `reserve_sweep_dense_nonauto`
+measured faster on the branch at p50 and p99 (21 375 ns → 15 127 ns
+and 56 543 ns → 37 151 ns); the added admission-time counting and
+exclusive-gate work cannot explain a branch that is faster than `main`,
+so no improvement is claimed here, only that the dense, many-maker
+level is not slower.
 
-Separately, `reserve_sweep_auto`'s p50 (`~916` ns) sits well above
-`reserve_sweep_nonauto`'s (`83` ns) on **both** `main` and the branch:
-a non-auto reserve maker is fully consumed and removed after one or
-two probes and the book then sits empty until the next refill, while
-an auto-replenishing maker keeps refilling from hidden and stays
-matchable across most of the refill window, so more of the 200 000
-probes do real matching work against it. `main` shows the identical
-gap, so this is a `pricelevel` matching-cost difference between the
-two reserve behaviours, not anything #230 adds; it is why each
-scenario is compared against its own `main` baseline above rather than
-against the other scenario.
+Separately, `reserve_sweep_auto`'s p50 (roughly 833-958 ns across the
+two sides) sits well above `reserve_sweep_nonauto`'s (83 ns) on both
+`main` and the branch: a non-auto reserve maker is fully consumed and
+removed after one or two probes and the book then sits empty until
+the next refill, while an auto-replenishing maker keeps refilling from
+hidden and stays matchable across most of the refill window, so more
+of the 200 000 probes do real matching work against it. `main` shows
+the same gap, so this is a `pricelevel` matching-cost difference
+between the two reserve behaviours, not anything #230 adds; it is why
+each scenario is compared against its own `main` baseline above rather
+than against another scenario.
+
+`reserve_sweep_mixed_armed` and `reserve_sweep_mixed_disarmed` land
+within noise of each other on the branch too (p50 1 167 ns vs
+1 167 ns, p99 5 751 ns vs 5 835 ns): on this thin, iceberg-heavy
+workload the wasted walk `mixed_armed` pays is too small relative to
+run-to-run noise to separate from the zero-cost closed-gate path
+`mixed_disarmed` takes. `reserve_sweep_dense_nonauto` above, where the
+same walk runs against up to 64 makers instead of 3 thin icebergs, is
+the clearer window onto its absolute cost.
 
 Like every scenario in this suite, this is **closed-loop, per-probe
 service time**: see "Coordinated omission" above; it under-reports the
