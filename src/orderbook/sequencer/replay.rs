@@ -10,6 +10,7 @@ use super::journal::Journal;
 use super::types::{SequencerCommand, SequencerEvent, SequencerResult};
 use crate::orderbook::clock::Clock;
 use crate::orderbook::fees::FeeSchedule;
+use crate::orderbook::reject_reason::RejectReason;
 use crate::orderbook::stp::STPMode;
 use crate::orderbook::{OrderBook, OrderBookError, OrderBookSnapshot};
 use serde::{Deserialize, Serialize};
@@ -233,6 +234,34 @@ pub enum ReplayError {
         source: OrderBookError,
     },
 
+    /// A re-executed submit reached a different verdict than the journal
+    /// recorded.
+    ///
+    /// Raised for an `AddOrder` / `MarketOrder` / `MarketOrderByAmount`
+    /// event journaled as [`SequencerResult::RejectedWithCode`] whose
+    /// re-execution succeeded, or failed under a different
+    /// [`RejectReason`]. Replay applies such a rejection by re-executing
+    /// it, because the live command may have traded before it failed; the
+    /// reproduced fills are only faithful if the re-execution fails the
+    /// same way, so a disagreement means the reconstructed book has
+    /// diverged from the live one — typically a [`ReplayBookConfig`] that
+    /// does not match the source book, a journal that does not start at
+    /// the book's origin, or state the journal cannot carry (a market
+    /// order's user identity).
+    #[error(
+        "replay diverged at sequence {sequence_num}: journal recorded rejection `{recorded}`, replay {}",
+        describe_outcome(.actual)
+    )]
+    OutcomeMismatch {
+        /// The sequence number of the event whose verdict disagreed.
+        sequence_num: u64,
+        /// The reject code the journal recorded.
+        recorded: RejectReason,
+        /// What the re-execution produced: `None` when it succeeded,
+        /// `Some(err)` when it failed under a different code.
+        actual: Option<OrderBookError>,
+    },
+
     /// A trade-ID namespace was injected for a suffix replay.
     ///
     /// [`OrderBook::set_trade_id_namespace`] restarts the UUID v5 counter at
@@ -260,6 +289,14 @@ pub enum ReplayError {
     JournalError(#[from] JournalError),
 }
 
+/// Renders the replay side of an [`ReplayError::OutcomeMismatch`].
+fn describe_outcome(actual: &Option<OrderBookError>) -> String {
+    match actual {
+        None => "succeeded".to_string(),
+        Some(err) => format!("failed with `{}` ({err})", RejectReason::from(err)),
+    }
+}
+
 /// Stateless replay engine that reconstructs [`OrderBook`] state from a [`Journal`].
 ///
 /// All methods are associated functions (no `&self` receiver) — `ReplayEngine`
@@ -275,8 +312,55 @@ where
     /// Replays all events from `from_sequence` onwards onto a fresh [`OrderBook`].
     ///
     /// Returns the reconstructed book and the sequence number of the last
-    /// event applied. Only successful commands (non-`Rejected` results) are
-    /// replayed — rejected events are skipped without error.
+    /// event applied — the last command dispatched to the book, whether or
+    /// not it changed the book.
+    ///
+    /// # Which events are applied
+    ///
+    /// Every successfully-journaled command is dispatched and must succeed
+    /// again ([`ReplayError::OrderBookError`] otherwise). A rejected event
+    /// is handled by what the journal recorded:
+    ///
+    /// - A submit (`AddOrder`, `MarketOrder`, `MarketOrderByAmount`)
+    ///   journaled as [`SequencerResult::RejectedWithCode`] is re-executed
+    ///   when replay can reproduce its rejection from the book state and
+    ///   the book configuration alone: the two codes the engine returns
+    ///   after it may already have traded —
+    ///   [`RejectReason::InsufficientLiquidity`] (an IOC or market
+    ///   remainder) and [`RejectReason::SelfTradePrevention`] (a taker
+    ///   cancelled after non-self fills) — and the pure admission
+    ///   rejections (tick, lot, size band, duplicate id, missing user,
+    ///   post-only crossing). The re-execution reproduces the fills the
+    ///   live command made before failing, and must fail under the same
+    ///   [`RejectReason`]; a success, or a different code, aborts with
+    ///   [`ReplayError::OutcomeMismatch`] because the reconstructed book
+    ///   has diverged. A code whose trigger lives outside the
+    ///   configuration — the kill switch, the risk limits,
+    ///   [`RejectReason::Other`] — is skipped: those rejections never
+    ///   touch the book, so the skip reproduces the live outcome exactly.
+    /// - A submit journaled as the string-only [`SequencerResult::Rejected`]
+    ///   is skipped, as it always was: without a code replay cannot tell a
+    ///   pure rejection from one that traded first, so such a journal keeps
+    ///   the pre-existing gap for traded-then-rejected submits. Producers
+    ///   close it by recording `RejectedWithCode`
+    ///   (`SequencerResult::from(&OrderBookError)`).
+    /// - Every other rejected command is skipped: the modify paths validate
+    ///   before touching the book and cancels are no-ops on a missing
+    ///   order, so a rejected non-submit is failure-atomic.
+    ///
+    /// Skipped events do not advance the applied sequence or the applied
+    /// count; a re-executed rejection does, whether or not it traded.
+    /// Journals are expected to record the outcome the command API
+    /// returned: a success recorded for a command that returned `Err` (a
+    /// `TradeExecuted` captured from a `TradeListener` before `add_order`
+    /// failed, say) is not a supported convention and aborts as a
+    /// success/failure disagreement.
+    ///
+    /// `MarketOrder` / `MarketOrderByAmount` carry no user id, so they
+    /// replay through the STP-less submit paths; a market order journaled
+    /// after STP effects under a user cannot be represented, and a
+    /// rejection recorded for it aborts with `OutcomeMismatch` rather than
+    /// diverging silently.
     ///
     /// For deterministic replay with a custom clock, see
     /// [`Self::replay_from_with_clock`].
@@ -308,6 +392,7 @@ where
     /// - [`ReplayError::EmptyJournal`] if the journal has no events
     /// - [`ReplayError::InvalidSequence`] if `from_sequence` > last journal sequence
     /// - [`ReplayError::OrderBookError`] if a command fails unexpectedly during replay
+    /// - [`ReplayError::OutcomeMismatch`] if a re-executed rejected submit reaches a different verdict than the journal recorded
     /// - [`ReplayError::JournalError`] if reading from the journal fails
     #[must_use = "replay result carries the reconstructed book and the last applied sequence"]
     pub fn replay_from(
@@ -615,12 +700,14 @@ where
             }
 
             // Advance `expected_seq` before applying so gap detection stays
-            // correct even if the event is a rejected no-op. `last_applied_seq`,
-            // `count`, and `progress` track only events that actually mutate
-            // the book — consistent with the "events applied" / "last applied
-            // sequence" contract on the public entry points.
-            let applied = !matches!(event.result, SequencerResult::Rejected { .. });
-            Self::apply_event(book, event)?;
+            // correct even if the event is skipped. `last_applied_seq`,
+            // `count`, and `progress` track the events `apply_event`
+            // dispatched to the book — including a re-executed rejection,
+            // which may have traded before it failed — consistent with the
+            // "events applied" / "last applied sequence" contract on the
+            // public entry points. Applied means dispatched, not that the
+            // book changed.
+            let applied = Self::apply_event(book, event)?;
             // Protocol counter: a saturating add would silently stop advancing
             // `expected_seq` at the u64 ceiling and mask a real gap, so use a
             // checked add and surface a typed overflow error instead (per the
@@ -663,39 +750,57 @@ where
 
     /// Applies a single sequencer event to the given book.
     ///
-    /// A submit — `AddOrder`, `MarketOrder`, `MarketOrderByAmount` — is
-    /// always re-executed, because it can execute real trades and *then*
-    /// return `Err`: an IOC whose remainder is unfillable, a taker STP
-    /// cancels after non-self fills, and a market order that only cancels
-    /// same-user makers under `CancelMaker` all report failure over a
-    /// mutated book. A sequencer records those as `Rejected`, so skipping
-    /// them resurrected liquidity the live book had consumed. Replay
-    /// re-executes matching deterministically, so those fills are
-    /// reproduced by the re-execution itself — see
-    /// [`Self::reconcile_submit`] for which of its errors are tolerated.
+    /// Returns `true` when the command was dispatched to the book and its
+    /// outcome reconciled against the journaled result, `false` when the
+    /// event was skipped. Applied means dispatched, not that the book
+    /// changed: a re-executed rejection that fails the same way it failed
+    /// live is applied and leaves the book untouched.
     ///
-    /// Every other command is failure-atomic (the modify paths validate
-    /// before touching the book, cancels are no-ops on a missing order), so
-    /// a `Rejected` result still skips it.
-    fn apply_event(book: &OrderBook<T>, event: &SequencerEvent<T>) -> Result<(), ReplayError> {
-        let rejected_live = matches!(event.result, SequencerResult::Rejected { .. });
+    /// A successfully-journaled command is always dispatched. A rejected
+    /// event is dispatched only when it is a submit — `AddOrder`,
+    /// `MarketOrder`, `MarketOrderByAmount` — journaled as
+    /// [`SequencerResult::RejectedWithCode`] under a code
+    /// [`Self::replays_rejection`] accepts. That is what makes the
+    /// rejections that follow a mutation faithful: an IOC whose remainder
+    /// is unfillable and a taker STP cancels after non-self fills both
+    /// execute real trades and *then* return `Err`, so skipping them
+    /// resurrected liquidity the live book had consumed. Replay
+    /// re-executes matching deterministically, so those fills are
+    /// reproduced by the re-execution itself; the recorded code is read
+    /// only to check the verdict, in [`Self::reconcile_submit`].
+    ///
+    /// Every other rejected event is skipped: a string-only
+    /// [`SequencerResult::Rejected`] carries no code to decide by (the
+    /// historical behaviour, and the documented gap for such journals),
+    /// and a rejected non-submit is failure-atomic — the modify paths
+    /// validate before touching the book and cancels are no-ops on a
+    /// missing order.
+    ///
+    /// The full contract, including the stated limitations, is documented
+    /// on [`Self::replay_from`].
+    fn apply_event(book: &OrderBook<T>, event: &SequencerEvent<T>) -> Result<bool, ReplayError> {
         let is_submit = matches!(
             event.command,
             SequencerCommand::AddOrder(_)
                 | SequencerCommand::MarketOrder { .. }
                 | SequencerCommand::MarketOrderByAmount { .. }
         );
-        if rejected_live && !is_submit {
-            return Ok(());
-        }
+        // The reject code the journal recorded for a submit replay
+        // re-executes; `None` for a journaled success.
+        let recorded = match &event.result {
+            SequencerResult::Rejected { .. } => return Ok(false),
+            SequencerResult::RejectedWithCode { code, .. } => {
+                if !is_submit || !Self::replays_rejection(*code) {
+                    return Ok(false);
+                }
+                Some(*code)
+            }
+            _ => None,
+        };
 
         match &event.command {
             SequencerCommand::AddOrder(order) => {
-                Self::reconcile_submit(
-                    event,
-                    rejected_live,
-                    book.add_order(order.clone()).map(|_| ()),
-                )?;
+                Self::reconcile_submit(event, recorded, book.add_order(order.clone()).map(|_| ()))?;
             }
             SequencerCommand::CancelOrder(id) => {
                 book.cancel_order(*id)
@@ -714,14 +819,14 @@ where
             SequencerCommand::MarketOrder { id, quantity, side } => {
                 Self::reconcile_submit(
                     event,
-                    rejected_live,
+                    recorded,
                     book.submit_market_order(*id, *quantity, *side).map(|_| ()),
                 )?;
             }
             SequencerCommand::MarketOrderByAmount { id, amount, side } => {
                 Self::reconcile_submit(
                     event,
-                    rejected_live,
+                    recorded,
                     book.submit_market_order_by_amount(*id, *amount, *side)
                         .map(|_| ()),
                 )?;
@@ -750,39 +855,83 @@ where
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
-    /// Reconciles a re-executed submit's outcome against the journaled one.
+    /// Whether a submit journaled as rejected under `code` is re-executed
+    /// on replay.
     ///
-    /// Tolerated:
-    /// - any error when the live execution failed too (`rejected_live`) —
-    ///   replay reached the same verdict, and whatever the live command
-    ///   mutated before failing this one mutated as well;
-    /// - `InsufficientLiquidity` / `InsufficientLiquidityNotional` /
-    ///   `SelfTradePrevented` regardless of the journaled result: these are
-    ///   the errors a submit returns *after* real fills, so a sequencer that
-    ///   records the fills rather than the rejection is journaling the truth
-    ///   and replay must not abort on them.
+    /// Re-executed: every code whose rejection the engine derives from the
+    /// book state and [`ReplayBookConfig`] alone, so the re-execution
+    /// reproduces the live verdict. That covers the two codes the engine
+    /// returns after it may already have traded —
+    /// [`RejectReason::InsufficientLiquidity`] (an IOC or market remainder)
+    /// and [`RejectReason::SelfTradePrevention`] (a taker cancelled after
+    /// non-self fills) — and the pure admission rejections (tick, lot, size
+    /// band, duplicate id, missing user, post-only crossing), which
+    /// re-derive the same no-op and double as a check that the config
+    /// matches the source book.
     ///
-    /// Every other error means replay diverged from the recorded execution
-    /// and is surfaced as [`ReplayError::OrderBookError`].
+    /// Skipped: codes whose trigger lives outside the config — the kill
+    /// switch ([`RejectReason::KillSwitchActive`]), the per-account risk
+    /// limits (`RiskMaxOpenOrders` / `RiskMaxNotional` / `RiskPriceBand`; a
+    /// `RiskConfig` is not part of `ReplayBookConfig`) and application-side
+    /// or internal codes ([`RejectReason::Other`]). None of them mutates
+    /// the book, so skipping reproduces the live outcome exactly, while
+    /// re-executing would apply a command the live book refused: under an
+    /// engaged kill switch a rejected GTC would rest on replay, and a
+    /// rejected IOC would consume liquidity the live book never touched.
+    ///
+    /// `RejectReason` is `#[non_exhaustive]`; a named code this table does
+    /// not list is re-executed, so a divergence surfaces as
+    /// [`ReplayError::OutcomeMismatch`] rather than being skipped silently.
+    #[must_use]
+    fn replays_rejection(code: RejectReason) -> bool {
+        !matches!(
+            code,
+            RejectReason::KillSwitchActive
+                | RejectReason::RiskMaxOpenOrders
+                | RejectReason::RiskMaxNotional
+                | RejectReason::RiskPriceBand
+                | RejectReason::Other(_)
+        )
+    }
+
+    /// Reconciles a dispatched submit's outcome against the journaled one.
+    ///
+    /// `recorded` is the reject code the journal carries when the live
+    /// execution failed, `None` when it succeeded. Replay must reach the
+    /// same verdict:
+    ///
+    /// - journaled success: the re-execution must succeed; an error is
+    ///   [`ReplayError::OrderBookError`], as it always was;
+    /// - journaled rejection: the re-execution must fail under the same
+    ///   [`RejectReason`]; a success, or a failure under a different code,
+    ///   is [`ReplayError::OutcomeMismatch`]. The fills the live command
+    ///   made before failing are reproduced only if the verdicts agree, so
+    ///   a disagreement means the reconstructed book has diverged.
+    ///
+    /// Only the code is compared, not the error's details (`requested` /
+    /// `available` on `InsufficientLiquidity`, say): the journal carries
+    /// the code, and a divergence confined to the details is a divergence
+    /// in the book that the next dispatched command or a final
+    /// [`snapshots_match`] surfaces.
     fn reconcile_submit(
         event: &SequencerEvent<T>,
-        rejected_live: bool,
+        recorded: Option<RejectReason>,
         outcome: Result<(), OrderBookError>,
     ) -> Result<(), ReplayError> {
-        match outcome {
-            Ok(()) => Ok(()),
-            Err(_) if rejected_live => Ok(()),
-            Err(
-                OrderBookError::InsufficientLiquidity { .. }
-                | OrderBookError::InsufficientLiquidityNotional { .. }
-                | OrderBookError::SelfTradePrevented { .. },
-            ) => Ok(()),
-            Err(source) => Err(ReplayError::OrderBookError {
+        match (recorded, outcome) {
+            (None, Ok(())) => Ok(()),
+            (None, Err(source)) => Err(ReplayError::OrderBookError {
                 sequence_num: event.sequence_num,
                 source,
+            }),
+            (Some(code), Err(actual)) if RejectReason::from(&actual) == code => Ok(()),
+            (Some(code), outcome) => Err(ReplayError::OutcomeMismatch {
+                sequence_num: event.sequence_num,
+                recorded: code,
+                actual: outcome.err(),
             }),
         }
     }
