@@ -608,14 +608,26 @@ where
                             }
                         }
                         // Reachability: the same-user maker is only reached
-                        // if the taker still has quantity left after the
-                        // non-self depth in front of it. A taker the
-                        // pre-match already satisfied never self-trades, so
-                        // this is an ordinary complete fill — the rule
-                        // `check_modify_stp_self_cross` already applies when
-                        // it dry-runs this same decision (#168).
+                        // if the taker can still execute at this price after
+                        // the non-self depth in front of it. Two ways it
+                        // cannot. A budget the pre-match exhausted is an
+                        // ordinary complete fill. A residual that cannot fund
+                        // one more lot at this price never executes here
+                        // either — `is_done()` is exact zero, and a
+                        // quote-amount budget normally ends in dust below one
+                        // unit rather than at zero — so the maker is
+                        // unreachable and survives; but that residual is not
+                        // necessarily dead: a quote-amount sell can still
+                        // afford a whole lot at a cheaper bid further down,
+                        // so walk on rather than break (for a buy the next
+                        // ask is dearer and the loop's own cap check ends the
+                        // sweep). `check_modify_stp_self_cross` dry-runs the
+                        // same decision on the modify path (#168).
                         if stop.is_done() {
                             break;
+                        }
+                        if stop.level_qty_cap(price, lot) == 0 {
+                            continue;
                         }
                         stp_taker_cancelled = true;
                         break;
@@ -696,9 +708,14 @@ where
                         }
                         // Same reachability rule as `CancelTaker` above, and
                         // here it also gates the maker cancellation: a maker
-                        // the taker never reached must survive untouched.
+                        // the taker never reached must survive untouched,
+                        // whether the budget is spent or only dust below one
+                        // lot at this price is left.
                         if stop.is_done() {
                             break;
+                        }
+                        if stop.level_qty_cap(price, lot) == 0 {
+                            continue;
                         }
                         // Cancel the maker on the held level for the same lockstep
                         // event + state + risk effects as CancelMaker (#95); level

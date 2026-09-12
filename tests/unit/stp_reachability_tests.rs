@@ -1,18 +1,20 @@
 //! STP fires only on a same-user maker the taker can actually reach.
 //!
 //! `check_stp_at_level` reports a conflict whenever a same-user maker rests
-//! at a crossed level, but the taker only self-trades if it still has
-//! quantity left after consuming the non-self depth in front of that maker.
-//! The `CancelTaker` / `CancelBoth` arms are entered only when that residual
-//! is non-zero — the same reachability rule `check_modify_stp_self_cross`
-//! already applies on the modify path.
+//! at a crossed level, but the taker only self-trades if it can still
+//! execute at that price after consuming the non-self depth in front of
+//! that maker. The `CancelTaker` / `CancelBoth` arms cancel only when the
+//! residual can fund another lot at the level: a spent budget is a complete
+//! fill, and quote-amount dust below one unit leaves the maker untouched
+//! and walks on to the next level, where a cheaper bid may still be
+//! affordable.
 
 #[cfg(test)]
 mod tests_stp_reachability {
     use orderbook_rs::orderbook::order_state::{CancelReason, OrderStateTracker, OrderStatus};
     use orderbook_rs::orderbook::stp::STPMode;
     use orderbook_rs::{DefaultOrderBook, OrderBook, OrderBookError, TradeResult};
-    use pricelevel::{Hash32, Id, Side, TimeInForce};
+    use pricelevel::{Hash32, Id, MatchResult, Side, TimeInForce};
 
     const PRICE: u128 = 100;
     /// Ahead in the queue and owned by someone else: reachable depth.
@@ -51,6 +53,15 @@ mod tests_stp_reachability {
         )
         .expect("seed same-user maker");
         book
+    }
+
+    fn executed(result: &MatchResult) -> u64 {
+        result
+            .trades()
+            .as_vec()
+            .iter()
+            .map(|t| t.quantity().as_u64())
+            .fold(0u64, u64::saturating_add)
     }
 
     fn filled(result: &Option<TradeResult>) -> u64 {
@@ -193,57 +204,210 @@ mod tests_stp_reachability {
             .submit_market_order_with_user(Id::from_u64(TAKER), 3, Side::Buy, user(1))
             .expect("market taker never reaches the same-user maker");
 
-        let executed: u64 = result
-            .trades()
-            .as_vec()
-            .iter()
-            .map(|t| t.quantity().as_u64())
-            .sum();
-        assert_eq!(executed, 3, "filled against the non-self maker");
+        assert_eq!(executed(&result), 3, "filled against the non-self maker");
         assert_self_maker_intact(&book);
     }
 
-    /// Unchanged behaviour: a taker with quantity left over after the
-    /// non-self depth does reach the same-user maker and is cancelled.
+    /// The quote-amount twin: a notional budget normally ends in dust below
+    /// one unit, never at exactly zero, so an exact-zero guard alone still
+    /// cancelled the untouched maker (and, under `CancelBoth`, returned
+    /// `Ok` while doing it). 350 at 100 buys 3 lots and leaves 50 — not
+    /// enough for a fourth unit, so the same-user maker is never reached.
     #[test]
-    fn reachable_self_maker_reports_self_trade_prevented() {
+    fn quote_amount_buy_dust_leaves_unreachable_maker_intact() {
         for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
             let book = book_with_self_maker_behind(mode);
 
-            let err = book
-                .add_limit_order_with_user(
+            let result = book
+                .submit_market_order_by_amount_with_user(
                     Id::from_u64(TAKER),
-                    PRICE,
-                    7,
+                    350,
+                    Side::Buy,
+                    user(1),
+                )
+                .unwrap_or_else(|e| panic!("{mode}: dust never reaches the maker, got {e:?}"));
+
+            assert_eq!(
+                executed(&result),
+                3,
+                "{mode}: filled against the non-self maker"
+            );
+            assert_self_maker_intact(&book);
+        }
+    }
+
+    /// Unchanged behaviour on the quote-amount path: a budget that can still
+    /// fund a whole unit at the level does reach the same-user maker.
+    #[test]
+    fn quote_amount_buy_with_a_reachable_maker_still_fires() {
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let book = book_with_self_maker_behind(mode);
+
+            // 600 buys the 5 non-self lots and still funds one more unit.
+            let result = book
+                .submit_market_order_by_amount_with_user(
+                    Id::from_u64(TAKER),
+                    600,
+                    Side::Buy,
+                    user(1),
+                )
+                .unwrap_or_else(|e| panic!("{mode}: non-self fills make this Ok, got {e:?}"));
+
+            assert_eq!(
+                executed(&result),
+                5,
+                "{mode}: the non-self depth ahead of the maker was consumed"
+            );
+            match mode {
+                STPMode::CancelBoth => {
+                    assert!(
+                        book.get_order(Id::from_u64(SELF_MAKER)).is_none(),
+                        "CancelBoth cancels the reached maker"
+                    );
+                    assert_eq!(
+                        book.order_status(Id::from_u64(SELF_MAKER)),
+                        Some(OrderStatus::Cancelled {
+                            filled_quantity: 0,
+                            reason: CancelReason::SelfTradePrevention,
+                        }),
+                        "the reached maker is cancelled by STP"
+                    );
+                }
+                _ => assert_self_maker_intact(&book),
+            }
+        }
+    }
+
+    /// Dust at one price is not a dead budget. A quote-amount sell that
+    /// cannot afford another unit at 100 can still afford one at 50, so the
+    /// sweep must preserve the same-user maker at 100 and walk on rather
+    /// than stop at the level it cannot execute on.
+    #[test]
+    fn quote_amount_sell_walks_past_a_level_it_cannot_afford() {
+        const OTHER_AT_100: u64 = 11;
+        const SELF_AT_100: u64 = 12;
+        const OTHER_AT_50: u64 = 13;
+
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let mut book: OrderBook<()> = DefaultOrderBook::new("STPQ");
+            book.set_stp_mode(mode);
+            book.set_order_state_tracker(OrderStateTracker::new());
+            for (id, price, owner) in [
+                (OTHER_AT_100, 100, user(2)),
+                (SELF_AT_100, 100, user(1)),
+                (OTHER_AT_50, 50, user(2)),
+            ] {
+                book.add_limit_order_with_user(
+                    Id::from_u64(id),
+                    price,
+                    1,
                     Side::Buy,
                     TimeInForce::Gtc,
-                    user(1),
+                    owner,
                     None,
                 )
-                .expect_err("reachable self-trade is prevented");
+                .expect("seed bid");
+            }
+
+            // 150 sells one unit at 100 (the non-self bid), leaving 50: dust
+            // at 100, a whole unit at 50.
+            let result = book
+                .submit_market_order_by_amount_with_user(
+                    Id::from_u64(TAKER),
+                    150,
+                    Side::Sell,
+                    user(1),
+                )
+                .unwrap_or_else(|e| panic!("{mode}: the sweep continues to 50, got {e:?}"));
+
+            assert_eq!(
+                executed(&result),
+                2,
+                "{mode}: one unit at 100 and one at 50"
+            );
             assert!(
-                matches!(err, OrderBookError::SelfTradePrevented { .. }),
-                "{mode}: expected SelfTradePrevented, got {err:?}"
+                book.get_order(Id::from_u64(OTHER_AT_100)).is_none()
+                    && book.get_order(Id::from_u64(OTHER_AT_50)).is_none(),
+                "{mode}: both non-self bids were consumed"
+            );
+            let self_bid = book
+                .get_order(Id::from_u64(SELF_AT_100))
+                .unwrap_or_else(|| panic!("{mode}: the unaffordable same-user bid survives"));
+            assert_eq!(self_bid.visible_quantity().as_u64(), 1);
+            assert!(
+                !matches!(
+                    book.order_status(Id::from_u64(SELF_AT_100)),
+                    Some(OrderStatus::Cancelled { .. })
+                ),
+                "{mode}: no cancel recorded for an unreachable maker"
             );
             assert_eq!(
-                book.order_status(Id::from_u64(TAKER)),
-                Some(OrderStatus::Cancelled {
-                    filled_quantity: 5,
-                    reason: CancelReason::SelfTradePrevention,
-                }),
-                "{mode}: taker cancelled with its true non-self fill"
+                book.best_bid(),
+                Some(100),
+                "{mode}: the self bid still tops the book"
             );
+        }
+    }
 
-            match mode {
-                STPMode::CancelBoth => assert!(
-                    book.get_order(Id::from_u64(SELF_MAKER)).is_none(),
-                    "CancelBoth cancels the reached maker"
+    /// Lot rounding produces the same dust: with a lot of 5, a budget of
+    /// 700 at 100 caps at 7, rounds to 5, fills the non-self lot, and the
+    /// 200 left over cannot fund another whole lot. The maker is untouched
+    /// and the taker keeps its fill rather than being cancelled.
+    #[test]
+    fn lot_rounded_quote_residual_leaves_unreachable_maker_intact() {
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let mut book: OrderBook<()> = DefaultOrderBook::new("STPL");
+            book.set_stp_mode(mode);
+            book.set_lot_size(5);
+            book.set_order_state_tracker(OrderStateTracker::new());
+            book.add_limit_order_with_user(
+                Id::from_u64(OTHER_MAKER),
+                PRICE,
+                5,
+                Side::Sell,
+                TimeInForce::Gtc,
+                user(2),
+                None,
+            )
+            .expect("seed non-self maker");
+            book.add_limit_order_with_user(
+                Id::from_u64(SELF_MAKER),
+                PRICE,
+                10,
+                Side::Sell,
+                TimeInForce::Gtc,
+                user(1),
+                None,
+            )
+            .expect("seed same-user maker");
+
+            let result = book
+                .submit_market_order_by_amount_with_user(
+                    Id::from_u64(TAKER),
+                    700,
+                    Side::Buy,
+                    user(1),
+                )
+                .unwrap_or_else(|e| {
+                    panic!("{mode}: a sub-lot residual never reaches the maker, got {e:?}")
+                });
+
+            assert_eq!(
+                executed(&result),
+                5,
+                "{mode}: one whole lot against the non-self maker"
+            );
+            let maker = book
+                .get_order(Id::from_u64(SELF_MAKER))
+                .unwrap_or_else(|| panic!("{mode}: same-user maker still rests"));
+            assert_eq!(maker.visible_quantity().as_u64(), 10);
+            assert!(
+                !matches!(
+                    book.order_status(Id::from_u64(SELF_MAKER)),
+                    Some(OrderStatus::Cancelled { .. })
                 ),
-                _ => assert!(
-                    book.get_order(Id::from_u64(SELF_MAKER)).is_some(),
-                    "CancelTaker leaves the maker resting"
-                ),
-            }
+                "{mode}: no cancel recorded for an unreachable maker"
+            );
         }
     }
 }
