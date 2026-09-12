@@ -922,16 +922,18 @@ where
     ///   made before failing are reproduced only if the verdicts agree, so
     ///   a disagreement means the reconstructed book has diverged.
     ///
-    /// Only the code is compared, not the error's details (`requested` /
-    /// `available` on `InsufficientLiquidity`, say): the journal carries
-    /// the code, and a divergence confined to the details is a divergence
-    /// in the book that the next dispatched command or a final
-    /// [`snapshots_match`] surfaces. The same holds for a
+    /// **Limitation:** only the code is compared. The error's details
+    /// (`requested` / `available` on `InsufficientLiquidity`, say) and the
+    /// fills behind the rejection are not, and a discrepancy confined to
+    /// them may go undetected: different fills can exhaust the same levels
+    /// and leave identical snapshots, so neither a later command nor
+    /// [`snapshots_match`] is guaranteed to expose it. The same holds for a
     /// [`ReplayBookConfig`] that differs in a way the code cannot see — an
     /// STP mode that cancels the maker where the live one did not, both
-    /// reporting `SelfTradePrevention`: matching the source book's
+    /// reporting `SelfTradePrevention`. Matching the source book's
     /// configuration is the caller's contract on every `*_with_config`
-    /// entry point, and [`ReplayEngine::verify`] is the check for it.
+    /// entry point; [`ReplayEngine::verify`] checks the final structure,
+    /// not the execution history.
     fn reconcile_submit(
         event: &SequencerEvent<T>,
         recorded: Option<RejectReason>,
