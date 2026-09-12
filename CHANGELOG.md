@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Self-trade prevention holds under concurrent same-user admission
+  (#225).** With STP engaged the matching engine decided the
+  `STPAction` for a price level from a snapshot of that level's queue and
+  then acted on the decision in a second operation on the same level. Both
+  steps ran under the *shared* side of the book's submit gate, so any other
+  thread could admit, cancel or re-price an order in between and the verdict
+  was applied to state it had never been taken on. Observed under
+  `CancelMaker`: a same-user ask scanned a bid level, a same-user post-only
+  landed in that level while the scan's verdict was still in flight, and the
+  ask's sweep filled it — a same-user trade with the post-only as maker. The
+  same window corrupted `safe_quantity` under `CancelTaker` and `CancelBoth`
+  when the foreign maker resting ahead of the same-user maker was cancelled
+  concurrently.
+
+  The gate mode is now decided once, at the public boundary: an
+  STP-relevant submit (STP enabled and a non-zero taker `user_id`) and the
+  cancel-then-add modify variants whose re-add can match (`UpdatePrice`,
+  `UpdatePriceAndQuantity`, `Replace`) take the **exclusive** side of the
+  submit gate, so the scan and the fill it authorises observe the same
+  queue. Books on `STPMode::None`, post-only submits (they never run the
+  STP scan and never take liquidity), anonymous takers on the match-only
+  entry points (`add_order` rejects a zero `user_id` under STP with
+  `MissingUserId`), `UpdateQuantity` and `Cancel` are unchanged and keep
+  the shared, fully concurrent path; on an STP book every other submit
+  and every matching-capable re-price is therefore serialized.
+  Fill-or-kill keeps its existing exclusive gate
+  (#209). Internal helpers (`add_order_inner`, `cancel_order_with_reason`,
+  `match_order_with_user_outcome`, `match_order_by_amount_with_user`)
+  remain ungated and never upgrade, downgrade or re-acquire the lock.
+
+  Scope: the guarantee covers mutations performed through the `OrderBook`
+  API. The live `restore_from_snapshot(&self)` now takes the exclusive
+  side for its commit phase as well, so a restore can no longer
+  interleave with an in-flight submit (the `&mut self` package and JSON
+  restores were already exclusive by construction). Mutation applied
+  directly to the `Arc<PriceLevel>` handles returned by `get_bids()` /
+  `get_asks()` bypasses the gate entirely and is outside it (tracked in
+  #228).
+
+  Callback re-entrancy: the documented contract now also covers
+  `OrderStateListener`, which fires while the gate is held like
+  `TradeListener` and `PriceLevelChangedListener`. Any gated `OrderBook`
+  call made from one of these callbacks on the invoking thread may
+  deadlock, and always deadlocks when the gate is held exclusively; the
+  prohibition is absolute.
+
+  No public API, snapshot or journal change;
+  `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` is unchanged. Single-thread and
+  contention measurements are reported in the pull request.
+
 - **Reserve `UpdatePriceAndQuantity` honours the requested visible quantity
   (#221).** `OrderQuantity::set_quantity` read a `ReserveOrder`'s argument
   as a **total** target and only ever reduced: a requested increase was
