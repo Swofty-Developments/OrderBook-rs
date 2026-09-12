@@ -101,7 +101,11 @@
 //!   replenishment, filled for 10, used to rest 10 / 10 and now ends as
 //!   `Filled { filled_quantity: 10 }`; the same order with automatic
 //!   replenishment and a threshold of 5, filled for 8, used to rest 2 / 20
-//!   and now rests 12 / 10. The accounting rule is
+//!   and now rests 12 / 10. The discard needs the visible tranche to be
+//!   **exhausted**: with automatic replenishment off, a 10 / 20 reserve
+//!   filled for 5 still rests 5 / 20. An explicit `replenish_amount` is the
+//!   transfer, added to whatever visible quantity survived, not a target
+//!   display size. The accounting rule is
 //!   `submitted = executed + resting (visible + hidden) + discarded`, and
 //!   discarded quantity is never counted as executed. A discard emits an
 //!   `INFO` trace and, under the `metrics` feature, the new
@@ -114,22 +118,40 @@
 //!   validate-first pre-check now rejects a re-price that would exhaust such
 //!   a reserve's visible tranche with the new
 //!   `OrderBookError::ReserveResidualWouldBeDiscarded` **before** the
-//!   original is cancelled — a modify can never silently destroy the order
-//!   it modifies. Crossing into depth smaller than the visible tranche, and
-//!   a projected full fill, are both allowed through. `RejectReason` gains
-//!   the matching wire code 14; both enums are `#[non_exhaustive]`.
-//! - **A two-tranche order must display a positive visible tranche (#230).**
-//!   An iceberg or reserve with `visible_quantity == 0` behind
-//!   `hidden_quantity > 0` used to rest as a ghost: no visible depth,
-//!   unfillable, and removed by `pricelevel` with its whole hidden tranche
-//!   stranded on the first taker to reach the level. Since #221 a zero
-//!   quantity on `UpdateQuantity` / `UpdatePriceAndQuantity` / `Replace`
-//!   could drive a healthy resting order into that shape too.
-//!   `validate_order_shape` now rejects it with the new
-//!   `OrderBookError::ZeroVisibleTranche`, covering `add_order` and every
-//!   modify projection; a rejected modify leaves the original resting.
-//!   Single-tranche kinds are unaffected. Maps to the existing
-//!   `RejectReason::InvalidQuantity`.
+//!   original is cancelled, so **a re-price of such a reserve cannot destroy
+//!   the order it modifies**: the exclusive guard covers the lookup, the
+//!   validation, the cancel and the re-add, so the dry run is exact. That
+//!   is the scope of the guarantee; it is not a claim about every possible
+//!   modification failure. Crossing into depth smaller than the visible tranche, a
+//!   non-crossing re-price and a projected full fill are all allowed
+//!   through. The error carries both the projected `hidden_quantity` and the
+//!   `discarded_quantity` that would actually be destroyed. `RejectReason`
+//!   gains the matching wire code 14; both enums are `#[non_exhaustive]`.
+//!   In a book that **holds** such a reserve, every sweep now takes the
+//!   **exclusive** submit gate in every `STPMode` — matching-capable
+//!   submits, cancel-then-add re-prices and the match-only entry points
+//!   alike, plus the admission of the first one — so nothing can cancel,
+//!   admit or replace an order inside a sweep's capture window: the sweep
+//!   cannot consume a maker it never captured, nor report a captured maker
+//!   after a cancel freed its id. Cancels and mass cancels keep the shared
+//!   side. Those books serialize their sweeps; books holding none are
+//!   unchanged.
+//! - **A non-replenishing reserve must display a positive visible tranche
+//!   (#230).** A `ReserveOrder` with `auto_replenish == false`,
+//!   `visible_quantity == 0` and `hidden_quantity > 0` used to rest as a
+//!   ghost: no visible depth, and `pricelevel` removes it without a trade,
+//!   stranding the whole hidden tranche, on the first taker to reach the
+//!   level. Since #221 a zero quantity on `UpdateQuantity` /
+//!   `UpdatePriceAndQuantity` / `Replace` could drive a healthy resting
+//!   reserve into that shape too. `validate_order_shape` now rejects it with
+//!   the new `OrderBookError::ZeroVisibleTranche`, covering `add_order`,
+//!   every modify projection and snapshot restore; a rejected modify leaves
+//!   the original resting and a rejected restore leaves the book untouched.
+//!   The rule is that shape **only**: a zero-visible iceberg draws its whole
+//!   hidden tranche into visible on match, and a zero-visible
+//!   auto-replenishing reserve refreshes and re-queues, so both execute and
+//!   stay admissible. Single-tranche kinds are unaffected. Maps to the
+//!   existing `RejectReason::InvalidQuantity`.
 //! - **Reserve `UpdatePriceAndQuantity` honours the requested visible
 //!   quantity (#221).** `OrderQuantity::set_quantity` read a reserve's
 //!   argument as a **total** target and only ever reduced, so a requested

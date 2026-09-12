@@ -160,13 +160,17 @@ println!("Average price: {}", result.average_price());
   when the order carries no hidden tranche. `replenish_threshold` is
   unrestricted. Rejections return `OrderBookError::InvalidLotSize` naming the
   offending quantity
-- An Iceberg or Reserve order must display a positive visible tranche: a
-  `visible_quantity` of 0 behind a non-empty `hidden_quantity` is rejected
-  with `OrderBookError::ZeroVisibleTranche`, on `add_order` and on every
-  quantity-carrying modify (`UpdateQuantity`, `UpdatePriceAndQuantity`,
-  `Replace`, all of which set the visible tranche). Such an order would show
-  no depth, never fill, and lose its whole hidden tranche to the first taker
-  that reached its level
+- A Reserve order with `auto_replenish` off must display a positive visible
+  tranche: a `visible_quantity` of 0 behind a non-empty `hidden_quantity` is
+  rejected with `OrderBookError::ZeroVisibleTranche`, on `add_order`, on
+  every quantity-carrying modify (`UpdateQuantity`,
+  `UpdatePriceAndQuantity`, `Replace`, all of which set the visible tranche)
+  and on snapshot restore, where a snapshot holding the shape must be
+  repaired before it can be restored. That shape shows no depth, never fills, and loses
+  its whole hidden tranche to the first taker that reaches its level. The
+  other zero-visible two-tranche shapes execute instead of vanishing and
+  stay admissible: an Iceberg draws its entire hidden tranche into visible
+  on match, and an auto-replenishing Reserve refreshes and re-queues
 - An aggressive two-tranche order sweeps with its **total**, not with its
   visible tranche: a 10 visible / 20 hidden Reserve submitted into 20 units
   of contra liquidity executes 20. What its unmatched residual does follows
@@ -174,19 +178,23 @@ println!("Average price: {}", result.average_price());
   left below `max(replenish_threshold, 1)` — an emptied one always is — is
   refreshed from hidden (the explicit `replenish_amount`, or
   `DEFAULT_RESERVE_REPLENISH_AMOUNT` when there is none, capped by hidden)
-  and the residual rests. With it off the residual does not rest at all: its
-  hidden remainder is discarded and the order ends as
+  and the residual rests. With it off the residual is discarded **only when
+  the fill exhausted the visible tranche**: the order then ends as
   `OrderStatus::Filled { filled_quantity }` carrying only what executed,
   mirroring the resting side, where `pricelevel` removes a depleted
-  non-replenishing maker and strands its hidden tranche. The accounting rule
+  non-replenishing maker and strands its hidden tranche. A shallower fill
+  rests normally — that same 10 visible / 20 hidden Reserve filled for 5
+  rests 5 / 20 with nothing discarded. The accounting rule
   holds in every case, and discarded quantity is never counted as executed:
   `submitted = executed + resting (visible + hidden) + discarded`
-- The default refresh is capped by the hidden tranche, not by the size the
-  order first displayed, so a residual can rest showing more than it
-  originally showed: that 10 visible / 20 hidden Reserve with no explicit
-  `replenish_amount` and `auto_replenish` on, filled for 10, refreshes with
-  `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, 20) = 20` and rests 20 visible / 0
-  hidden. Set an explicit `replenish_amount` to pin the displayed size
+- An explicit `replenish_amount` is the **transfer**, not a target display
+  size: it is added to whatever visible quantity survived the fill. With
+  `replenish_amount = 10`, `replenish_threshold = 5` and a remainder of 2
+  visible, the residual rests 12 visible. Without an explicit amount the
+  transfer is `DEFAULT_RESERVE_REPLENISH_AMOUNT` capped by the hidden
+  tranche, so that 10 visible / 20 hidden Reserve filled for 10 refreshes
+  with `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, 20) = 20` and rests 20 visible
+  / 0 hidden — more than it first displayed
 
 **Time-In-Force:**
 - `Gtc` (Good-Till-Cancel): Remain until filled or cancelled
@@ -716,8 +724,20 @@ between and having the decision applied to a book state it was never taken
 on.
 
 Everything else stays on the shared side and runs concurrently. A book left
-on the default `STPMode::None` never takes the exclusive side except for
-fill-or-kill. Enabling STP therefore serializes every identified submit
+on the default `STPMode::None` takes the exclusive side for fill-or-kill
+and, from #230, while it **holds** a Reserve order with `auto_replenish` off
+that carries hidden quantity: every **sweep** on such a book is exclusive —
+every matching-capable submit, every cancel-then-add re-price and every
+match-only entry point (`match_order`, `match_market_order*`) — as is the
+admission of the first such reserve. A sweep decides once whether to capture
+makers whose hidden depth it would strand, so nothing may cancel, admit or
+replace an order inside that sweep's capture window; otherwise the sweep
+could consume a maker it never captured, or report a captured maker's hidden
+quantity after a cancel freed its id for an unrelated order. Post-only
+submits, `UpdateQuantity`, cancels and mass cancels keep the shared side and
+never consult the count: they are excluded by the sweep's hold, not by
+taking the exclusive side themselves. Those books serialize their sweeps, as
+STP books do; books holding no such reserve are unchanged. Enabling STP therefore serializes every identified submit
 except post-only, and every matching-capable re-price, on that book.
 Post-only orders never take liquidity and never run the STP scan, so
 they keep the shared side; they are excluded from an identified taker's

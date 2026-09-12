@@ -11,8 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`OrderBookError::ReserveResidualWouldBeDiscarded` and
   `OrderBookError::ZeroVisibleTranche` (#230).** Two new typed rejections on
-  the two-tranche admission and modify paths; see the `Fixed` entries below
-  for when each is raised. `OrderBookError` is `#[non_exhaustive]`, so
+  the reserve admission and modify paths; see the `Fixed` entries below
+  for when each is raised. `ReserveResidualWouldBeDiscarded` carries both
+  the projected `hidden_quantity` and the `discarded_quantity` that would
+  actually be destroyed. `OrderBookError` is `#[non_exhaustive]`, so
   downstream matches keep compiling.
 - **`RejectReason::ReserveResidualWouldBeDiscarded`, wire code 14 (#230).**
   Additive: `RejectReason` is `#[non_exhaustive]`, serializes as its `u16`
@@ -128,7 +130,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of a reserve-maker sweep, while the common-path benchmarks
   (`aggressive_walk_hdr`, `thin_book_sweep_hdr`) are unaffected. Both arms
   are covered by the `reserve_sweep_hdr` benchmark — see `BENCH.md` for the
-  figures. The
+  figures.
+
+  That once-per-sweep read is only coherent because of a new gate rule: in a
+  book that **holds** strandable makers, **every sweep takes the exclusive
+  side of the submit gate, in every `STPMode`** — matching-capable submits,
+  cancel-then-add re-prices and the match-only entry points (`match_order`,
+  `match_order_with_user`, `match_market_order_by_amount*`) alike —
+  alongside fill-or-kill (#209) and the STP-relevant submits (#225).
+  Admitting a strandable maker is exclusive too, which covers the very first
+  one, when the count is still zero. Post-only submits, `UpdateQuantity`,
+  cancels and mass cancels keep the shared side and never read the count;
+  they are excluded from a sweep's window by that sweep's hold, not by
+  taking the exclusive side themselves. The invariant:
+
+  > Every **sweep** in a book holding a strandable maker runs exclusively,
+  > so no cancel, mass cancel, admission or re-price can land inside its
+  > capture window.
+
+  Two interleavings needed it. A maker admitted at a level a sweep had not
+  reached yet would be consumed with no report, because the sweep had
+  already decided not to capture. And a maker the sweep *had* captured could
+  be cancelled and its id reused by an unrelated `Standard` order at the
+  same level, so the sweep would fill the impostor and report the reserve's
+  hidden quantity as discarded when nothing was stranded.
+
+  The gate mode is decided **before** anything is read, from the count and
+  the STP mode, never from a lookup that could go stale before acquisition;
+  a caller that takes the shared side re-reads the count and, if it grew,
+  drops the guard and restarts the whole operation exclusively (a fresh
+  acquisition, not a lock upgrade, which `std::sync::RwLock` cannot do). The
+  count can only increase under the exclusive side, so a shared holder that
+  saw zero knows it stays zero. Cost: books holding strandable makers
+  serialize their sweeps exactly as STP books have since #225; books holding
+  none pay one relaxed load and are otherwise unchanged. The count is exact
+  rather than conservative: increments sit at the only two places an order
+  is rested, decrements at the only three places such a maker leaves a
+  level and each decides from the removed order's own body, and the fill
+  drain's attribution cannot be stale because of the rule above.
+
+  The
   returned `Arc<OrderType>` on that branch now carries **both tranches at
   zero** rather than the stale hidden remainder, so `total_quantity()` is
   `0` for an order that rests nowhere; `add_order`'s docs state what each
@@ -152,15 +193,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is at least the projected visible tranche **and** less than the projected
   total, the modify is rejected with the new
   `OrderBookError::ReserveResidualWouldBeDiscarded { order_id,
-  visible_quantity, crossable_quantity, hidden_quantity }` before anything
-  is cancelled, so the original keeps resting untouched. Crossing into depth
+  visible_quantity, crossable_quantity, hidden_quantity,
+  discarded_quantity }` before anything
+  is cancelled, so the original keeps resting untouched. `hidden_quantity`
+  is the tranche as it would be re-added; `discarded_quantity` is what would
+  actually be destroyed (`visible + hidden - crossable`), so a 10 / 20
+  reserve crossing 15 reports hidden 20 and discarded 15. Crossing into depth
   smaller than the visible tranche is allowed (the residual rests with a
   positive visible tranche), and so is a projected **full** fill (it
-  executes everything and discards nothing). Auto-replenishing reserves,
+  executes everything and discards nothing) and a non-crossing re-price.
+  Auto-replenishing reserves,
   icebergs, single-tranche kinds and non-crossing re-prices never reach the
-  walk. Like the #168 check it is best-effort: exact under the exclusive
-  submit gate, raceable against a concurrent opposite-side mutation under
-  the shared side. The error maps to the new wire code
+  walk. The dry run is **exact**, not best-effort: whenever the check can
+  fire, the order being modified is itself a strandable maker, so the book's
+  count is at least one and the whole cancel-then-add — lookup, validation,
+  cancel and re-add — already runs on the exclusive side (see the gate note
+  below). The error maps to the new wire code
   `RejectReason::ReserveResidualWouldBeDiscarded = 14`; older deserializers
   carry it forward as `RejectReason::Other(14)`.
 
@@ -308,7 +356,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   STP scan and never take liquidity), anonymous takers on the match-only
   entry points (`add_order` rejects a zero `user_id` under STP with
   `MissingUserId`), `UpdateQuantity` and `Cancel` are unchanged and keep
-  the shared, fully concurrent path; on an STP book every other submit
+  the shared, fully concurrent path — with one addition from #230, which
+  takes the exclusive side in every `STPMode` for a submit or re-price of a
+  non-replenishing reserve carrying hidden quantity; on an STP book every other submit
   and every matching-capable re-price is therefore serialized.
   Fill-or-kill keeps its existing exclusive gate
   (#209). Internal helpers (`add_order_inner`, `cancel_order_with_reason`,
