@@ -31,6 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trace carrying a `path` field (`"taker"` / `"maker"`), the order id, the
   executed quantity and the discarded hidden quantity.
 
+- **`SequencerResult::RejectedWithCode { reason, code }`** — a rejection
+  carrying its stable wire-side `RejectReason` next to the message, and
+  `impl From<&OrderBookError> for SequencerResult` to build it from the
+  typed error in one step. Appended variant on the `#[non_exhaustive]`
+  enum: existing journals decode unchanged; journals carrying it fail to
+  decode against older binaries, matching the `MarketOrderByAmount`
+  precedent. The code encodes as its `u16` wire value.
+- **`ReplayError::OutcomeMismatch { sequence_num, recorded, actual }`** —
+  raised when a re-executed rejected submit succeeds or fails under a
+  different code than the journal recorded.
+
 ### Changed (breaking, semver-minor under 0.x)
 
 - **`OrderBook::get_bids` and `OrderBook::get_asks` are removed (#228).**
@@ -72,6 +83,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — obtain them from `OrderBook::levels_with_cumulative_depth`,
   `levels_until_depth` and `levels_in_range`, which is how every caller in
   this repository already did.
+
+- **`ReplayError` gained the `OutcomeMismatch` variant (#224)**, so
+  exhaustive matches need a new arm; 0.13.0 is the release boundary for
+  it together with the #228 removal above, as `NamespaceRequiresFullReplay`
+  shipped under 0.11.0. Journals carrying
+  `SequencerResult::RejectedWithCode` fail to decode against older binaries
+  (existing journals decode unchanged); no snapshot format change and no
+  `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` bump.
 
 ### Fixed
 
@@ -595,10 +614,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Rejected` keeps the historical skip and therefore the pre-existing gap
   (replay cannot tell a pure rejection from one that traded first without
   a code; producers close it by recording `RejectedWithCode`); only the
-  code is compared, not the error's details, so a replay config that
-  differs in a way the code cannot see (an STP mode that also cancels the
-  maker) is the caller's config contract and `ReplayEngine::verify`'s job
-  to catch, not reconciliation's; and `MarketOrder` /
+  code is compared, not the error's details or the fills behind it, and a
+  discrepancy confined to them may go undetected (different fills can
+  exhaust the same levels and leave identical snapshots), which also
+  covers a replay config that differs in a way the code cannot see, such
+  as an STP mode that also cancels the maker — matching the source book's
+  configuration is the caller's contract; and `MarketOrder` /
   `MarketOrderByAmount` carry no user id, so a market order journaled
   after STP effects under a user re-executes through the STP-less path
   and a rejection recorded for it aborts with `OutcomeMismatch` rather
@@ -609,21 +630,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejection keeps the skip; a rejected submit that succeeds on replay, or
   fails under a different code, aborts with `OutcomeMismatch`; a success
   journaled for a failed submit aborts with `OrderBookError`.
-
-### Added
-
-- **`SequencerResult::RejectedWithCode { reason, code }`** — a rejection
-  carrying its stable wire-side `RejectReason` next to the message, and
-  `impl From<&OrderBookError> for SequencerResult` to build it from the
-  typed error in one step. Appended variant on the `#[non_exhaustive]`
-  enum: existing journals decode unchanged; journals carrying it fail to
-  decode against older binaries, matching the `MarketOrderByAmount`
-  precedent. The code encodes as its `u16` wire value.
-- **`ReplayError::OutcomeMismatch { sequence_num, recorded, actual }`** —
-  raised when a re-executed rejected submit succeeds or fails under a
-  different code than the journal recorded. Additive on an exhaustive
-  enum: downstream exhaustive `match` expressions over `ReplayError` need
-  a new arm.
 
 ## [0.12.0] — 2026-07-14
 

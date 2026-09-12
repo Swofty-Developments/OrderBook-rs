@@ -34,7 +34,7 @@
 //!
 //! ## What's New in Version 0.13.0
 //!
-//! ### v0.13.0 — the public API hands out no level handles (#228); exclusive submit gate under STP (#225)
+//! ### v0.13.0 — the public API hands out no level handles (#228); exclusive submit gate under STP (#225); replay re-executes coded submit rejections (#224)
 //!
 //! - **Breaking (semver-minor under 0.x): `OrderBook::get_bids` and
 //!   `OrderBook::get_asks` are removed (#228).** Both cloned the book's live
@@ -75,6 +75,31 @@
 //!   post-only submits, `UpdateQuantity` and `Cancel` keep the shared, fully
 //!   concurrent path. With no level handles left to bypass it (#228), the
 //!   gate now covers every mutation.
+//! - **`SequencerResult::RejectedWithCode { reason, code: RejectReason }`.**
+//!   `add_order` emits real fills and *then* returns `Err` for an IOC's
+//!   unfillable remainder and for a taker STP cancels after non-self
+//!   fills; `ReplayEngine` skipped every rejected event, so replay rebuilt
+//!   liquidity the live book had consumed. Producers now opt in by
+//!   recording the typed outcome — `SequencerResult::from(&error)` fills
+//!   both fields — and replay decides by the recorded code: a submit
+//!   rejected under a code replay can reproduce from the book state and
+//!   `ReplayBookConfig` is re-executed and must fail the same way again,
+//!   codes whose trigger lives outside the config (kill switch, risk
+//!   limits, `Other`) are skipped, and `last_applied_seq` / the applied
+//!   count / the progress callback follow what was dispatched.
+//! - **`ReplayError::OutcomeMismatch { sequence_num, recorded, actual }`**
+//!   aborts replay when a re-executed rejection succeeds or fails under a
+//!   different code than the journal recorded.
+//! - **Migration.** The string-only `SequencerResult::Rejected` keeps its
+//!   historical skip, so a journal written with it keeps the pre-existing
+//!   gap for traded-then-rejected submits; switch producers to
+//!   `RejectedWithCode`. Journals carrying the new variant cannot be
+//!   decoded by older readers (existing journals decode unchanged, as for
+//!   `MarketOrderByAmount`). Only the reject code is reconciled, not the
+//!   error details or fills. **Breaking (semver-minor under 0.x):**
+//!   `ReplayError` gained a variant, so exhaustive matches need a new arm;
+//!   0.13.0 is the release boundary for it together with the #228 removal.
+//!   No snapshot format change.
 //! - **Reserve orders are lot-size validated per tranche and on their
 //!   replenishment transfer (#226).** A `ReserveOrder` used to be checked on
 //!   its **total** only, so a 15 visible / 5 hidden reserve was admitted to a
