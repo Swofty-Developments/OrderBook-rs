@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Reserve orders are lot-size validated per tranche and on their
+  replenishment transfer (#226).** On a book with a lot size,
+  `validate_order_shape` checked an `IcebergOrder` per tranche (visible and
+  hidden individually) but routed a `ReserveOrder` through a `_` catch-all
+  that only checked its **total**. With `lot_size = 10` a reserve of 15
+  visible / 5 hidden was admitted on its total of 20 while the identical
+  iceberg was rejected, and because the validator also runs on the
+  projected order of every modify arm (`UpdatePrice`, `UpdateQuantity`,
+  `UpdatePriceAndQuantity`, `Replace`) the asymmetry was reachable through
+  updates as well as through `add_order`.
+
+  The lot-size check is now an exhaustive match over every `OrderType`
+  variant. `Standard`, `PostOnly`, `TrailingStop`, `PeggedOrder` and
+  `MarketToLimit` keep the single-quantity rule. `ReserveOrder` takes the
+  iceberg's per-tranche rule — `visible` and `hidden` each a whole multiple
+  of the lot — and, additionally, validates the **capped transfer** that
+  replenishment moves from hidden into the visible tranche, since that
+  transfer is itself a quantity the book displays. The transfer is checked
+  only while `hidden > 0`: with `replenish_amount = Some(a)` it is
+  `min(a, hidden)` regardless of `auto_replenish`, because the
+  residual-resting path behind `set_total_remaining` refreshes an emptied
+  visible tranche from `replenish_amount` without consulting that flag
+  (that divergence from `pricelevel`'s `auto_replenish` contract is tracked
+  in #230); with `replenish_amount = None` and `auto_replenish = true` it is
+  `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, hidden)`, the amount `pricelevel`
+  transfers on depletion or below-threshold refresh; with
+  `replenish_amount = None` and `auto_replenish = false` nothing is ever
+  transferred and no extra check applies. `replenish_threshold` is
+  unrestricted — it is only compared against the visible tranche, never
+  transferred. Rejections use the existing
+  `OrderBookError::InvalidLotSize`, carrying the offending quantity — the
+  tranche or the transfer that failed.
+
+  Compatibility: admission is strictly tighter. A reserve order that was
+  previously admitted on its total — and any update projecting such a shape
+  — is now rejected with `InvalidLotSize`. A journal recorded before this
+  change that contains such an `AddOrder` or update therefore fails on
+  replay with `ReplayError::OrderBookError` when the `ReplayBookConfig`
+  carries the lot size; snapshot restoration does not run
+  `validate_order_shape`, so a legacy snapshot may still hold orders that
+  would now fail admission. Such a legacy order — restored from a snapshot,
+  or orphaned by a later `set_lot_size` — can be repaired through
+  `UpdateQuantity`, `UpdatePriceAndQuantity` or `Replace` when only its
+  visible tranche is misaligned (a 15 / 20 reserve on a new lot of 10
+  becomes 20 / 20, since every quantity-carrying update re-validates the
+  projected order); when its hidden tranche or its replenishment
+  configuration is what fails, no update can correct it and it must be
+  cancelled and re-submitted with aligned tranches. No public API, snapshot
+  format or
+  `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` change, and replenishment behaviour
+  itself (`reduce_reserve_to_total`, `set_total_remaining`, matching and
+  the upstream `pricelevel` semantics) is unchanged.
+
 - **Self-trade prevention holds under concurrent same-user admission
   (#225).** With STP engaged the matching engine decided the
   `STPAction` for a price level from a snapshot of that level's queue and
