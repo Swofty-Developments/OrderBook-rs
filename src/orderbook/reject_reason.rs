@@ -297,6 +297,52 @@ mod tests {
         assert_eq!(RejectReason::ReserveResidualWouldBeDiscarded.as_u16(), 14);
     }
 
+    /// #230: both new errors map to a wire code, and the new code 14 round
+    /// trips through `from_u16` with a readable `Display`.
+    #[test]
+    fn test_from_order_book_error_maps_the_reserve_residual_variants() {
+        let residual = OrderBookError::ReserveResidualWouldBeDiscarded {
+            order_id: Id::from_u64(1),
+            visible_quantity: 10,
+            crossable_quantity: 15,
+            hidden_quantity: 20,
+            discarded_quantity: 15,
+        };
+        assert_eq!(
+            RejectReason::from(&residual),
+            RejectReason::ReserveResidualWouldBeDiscarded,
+            "the residual rejection has its own wire code"
+        );
+
+        let ghost = OrderBookError::ZeroVisibleTranche {
+            order_id: Id::from_u64(2),
+            hidden_quantity: 20,
+        };
+        assert_eq!(
+            RejectReason::from(&ghost),
+            RejectReason::InvalidQuantity,
+            "the ghost rejection reuses the invalid-quantity code, like QuantityOverflow"
+        );
+    }
+
+    /// Code 14 is stable in both directions and reads as human text.
+    #[test]
+    fn test_reserve_residual_wire_code_round_trips() {
+        assert_eq!(
+            RejectReason::from_u16(14),
+            RejectReason::ReserveResidualWouldBeDiscarded
+        );
+        assert_eq!(
+            RejectReason::ReserveResidualWouldBeDiscarded.as_u16(),
+            14,
+            "the code is stable"
+        );
+        assert_eq!(
+            RejectReason::ReserveResidualWouldBeDiscarded.to_string(),
+            "reserve residual would be discarded"
+        );
+    }
+
     #[test]
     fn test_other_passthrough() {
         assert_eq!(RejectReason::Other(0).as_u16(), 0);

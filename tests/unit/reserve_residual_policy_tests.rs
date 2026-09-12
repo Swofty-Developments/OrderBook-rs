@@ -43,8 +43,10 @@
 //! cancel-then-add modify variants re-add the order as a taker, a re-price
 //! that would exhaust a non-auto reserve's visible tranche is rejected with
 //! `OrderBookError::ReserveResidualWouldBeDiscarded` **before** the original
-//! is cancelled, so a modify can never silently destroy the order it
-//! modifies.
+//! is cancelled, so a re-price of such a reserve cannot destroy the order it
+//! modifies: the gate is exclusive for the whole operation, so the dry run
+//! is exact. That is the scope of the guarantee, not a claim about every
+//! possible modification failure.
 
 #[cfg(test)]
 mod tests_reserve_residual_policy {
@@ -635,19 +637,197 @@ mod tests_reserve_residual_policy {
         assert!(book.best_bid().is_none(), "no level may be created");
     }
 
-    /// The identical iceberg shape is rejected on the same rule.
+    /// The identical **iceberg** shape is admitted, because it is not a
+    /// ghost: `pricelevel`'s degenerate guard draws the whole hidden tranche
+    /// into visible on match, so the order executes instead of vanishing.
+    /// Asserted by hitting it: a sell of 20 fills all 20.
     #[test]
-    fn test_add_order_iceberg_zero_visible_tranche_rejects() {
+    fn test_add_order_iceberg_zero_visible_tranche_admits_and_executes() {
         let book = tracked_book("ZERO-VIS-ICE");
         let order_id = Id::new();
 
-        assert_zero_visible(
-            book.add_order(iceberg_buy(order_id, PRICE, 0, HIDDEN)),
-            order_id,
-            HIDDEN,
-            "iceberg admission",
+        let rested = book.add_order(iceberg_buy(order_id, PRICE, 0, HIDDEN));
+        assert!(
+            rested.is_ok(),
+            "a zero-visible iceberg is executable, not a ghost: {rested:?}"
         );
-        assert!(book.get_order(order_id).is_none(), "a ghost must not rest");
+
+        let swept = book.add_limit_order_with_result(
+            Id::new(),
+            PRICE,
+            HIDDEN,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
+        let executed: u64 = match swept {
+            Ok((_, Some(trade))) => trade
+                .match_result
+                .trades()
+                .as_vec()
+                .iter()
+                .map(|print| print.quantity().as_u64())
+                .sum(),
+            other => panic!("expected a trade against the iceberg, got {other:?}"),
+        };
+        assert_eq!(
+            executed, HIDDEN,
+            "the hidden tranche is drawn into visible and executes in full"
+        );
+    }
+
+    /// An **auto-replenishing** reserve with no visible tranche is admitted
+    /// too: it refreshes `min(amount_or_default, hidden)` and re-queues, so
+    /// it executes rather than being removed with its hidden stranded.
+    #[test]
+    fn test_add_order_auto_reserve_zero_visible_tranche_admits_and_executes() {
+        let book = tracked_book("ZERO-VIS-AUTO");
+        let order_id = Id::new();
+        let mut order = reserve_buy(order_id, 0, Some(10), true);
+        if let OrderType::ReserveOrder {
+            visible_quantity, ..
+        } = &mut order
+        {
+            *visible_quantity = Quantity::new(0);
+        }
+
+        let rested = book.add_order(order);
+        assert!(
+            rested.is_ok(),
+            "a zero-visible auto reserve is executable: {rested:?}"
+        );
+
+        let swept = book.add_limit_order_with_result(
+            Id::new(),
+            PRICE,
+            10,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
+        let executed: u64 = match swept {
+            Ok((_, Some(trade))) => trade
+                .match_result
+                .trades()
+                .as_vec()
+                .iter()
+                .map(|print| print.quantity().as_u64())
+                .sum(),
+            other => panic!("expected a trade against the auto reserve, got {other:?}"),
+        };
+        assert_eq!(
+            executed, 10,
+            "the refresh makes the tranche matchable and it executes"
+        );
+    }
+
+    /// The zero-visible shapes as **aggressive takers** that partially fill
+    /// and rest. Both are admitted, so `set_total_remaining` has to produce
+    /// something sane for them; these assert what it actually produces.
+    #[test]
+    fn test_add_order_zero_visible_iceberg_taker_partial_fill_rests_display_zero() {
+        let book = tracked_book("ZERO-VIS-ICE-TAKER");
+        let contra_id = seed_contra(&book, PRICE, 5);
+        let taker_id = Id::new();
+
+        let submitted = book.add_order_with_result(iceberg_buy(taker_id, PRICE, 0, HIDDEN));
+        let executed: u64 = match submitted {
+            Ok((_, Some(trade))) => trade
+                .match_result
+                .trades()
+                .as_vec()
+                .iter()
+                .map(|print| print.quantity().as_u64())
+                .sum(),
+            other => panic!("expected a trade from the aggressive iceberg, got {other:?}"),
+        };
+        assert_eq!(
+            executed, 5,
+            "the sweep uses the total, not the display size"
+        );
+        assert_eq!(remaining_contra(&book, contra_id), 0, "contra consumed");
+
+        // `set_total_remaining` keeps the submitted display size, which is 0
+        // here, so the whole residual stays hidden. That is not a ghost: the
+        // upstream degenerate guard draws it into visible when a taker hits
+        // the level, which the next assertion exercises.
+        match book.get_order(taker_id) {
+            Some(order) => assert_eq!(
+                (
+                    order.visible_quantity().as_u64(),
+                    order.hidden_quantity().as_u64()
+                ),
+                (0, 15),
+                "display 0 leaves the residual entirely hidden"
+            ),
+            None => panic!("the iceberg residual must rest"),
+        }
+
+        let swept = book.add_limit_order_with_result(
+            Id::new(),
+            PRICE,
+            15,
+            Side::Sell,
+            TimeInForce::Gtc,
+            None,
+        );
+        let drained: u64 = match swept {
+            Ok((_, Some(trade))) => trade
+                .match_result
+                .trades()
+                .as_vec()
+                .iter()
+                .map(|print| print.quantity().as_u64())
+                .sum(),
+            other => panic!("expected a trade against the rested iceberg, got {other:?}"),
+        };
+        assert_eq!(
+            drained, 15,
+            "the rested residual is matchable: hidden is drawn into visible"
+        );
+    }
+
+    /// The auto-replenishing reserve with no visible tranche, crossing 5 of
+    /// its 30: the reduction leaves 0 visible, the threshold arm fires and
+    /// `min(10, hidden)` refreshes it, so the residual rests displayable.
+    #[test]
+    fn test_add_order_zero_visible_auto_reserve_taker_partial_fill_rests_refreshed() {
+        let book = tracked_book("ZERO-VIS-AUTO-TAKER");
+        let contra_id = seed_contra(&book, PRICE, 5);
+        let taker_id = Id::new();
+        let mut order = reserve_buy(taker_id, 0, Some(10), true);
+        if let OrderType::ReserveOrder {
+            visible_quantity, ..
+        } = &mut order
+        {
+            *visible_quantity = Quantity::new(0);
+        }
+
+        let submitted = book.add_order_with_result(order);
+        let executed: u64 = match submitted {
+            Ok((_, Some(trade))) => trade
+                .match_result
+                .trades()
+                .as_vec()
+                .iter()
+                .map(|print| print.quantity().as_u64())
+                .sum(),
+            other => panic!("expected a trade from the aggressive reserve, got {other:?}"),
+        };
+        assert_eq!(executed, 5, "the sweep uses the total of 20");
+        assert_eq!(remaining_contra(&book, contra_id), 0, "contra consumed");
+
+        match book.get_order(taker_id) {
+            Some(order) => assert_eq!(
+                (
+                    order.visible_quantity().as_u64(),
+                    order.hidden_quantity().as_u64()
+                ),
+                (10, 5),
+                "the emptied tranche is refreshed with min(10, 15)"
+            ),
+            None => panic!("the auto reserve residual must rest"),
+        }
     }
 
     /// Single-tranche kinds are outside the rule: a standard order carries
@@ -671,16 +851,12 @@ mod tests_reserve_residual_policy {
     /// tranche, so a zero would drive a healthy resting order into the ghost
     /// shape. All three arms reject it and leave the original untouched.
     #[test]
-    fn test_update_order_two_tranche_zero_quantity_rejects_and_preserves_original() {
-        for kind in ["reserve", "iceberg"] {
+    fn test_update_order_non_auto_reserve_zero_quantity_rejects_and_preserves_original() {
+        {
+            let kind = "reserve";
             let book = tracked_book("ZERO-VIS-MODIFY");
             let order_id = Id::new();
-            let maker = if kind == "reserve" {
-                reserve_buy(order_id, 0, None, false)
-            } else {
-                iceberg_buy(order_id, PRICE, VISIBLE, HIDDEN)
-            };
-            let rested = book.add_order(maker);
+            let rested = book.add_order(reserve_buy(order_id, 0, None, false));
             assert!(rested.is_ok(), "{kind}: seeding must succeed: {rested:?}");
 
             let updates = [
@@ -741,6 +917,39 @@ mod tests_reserve_residual_policy {
                     "{kind} / {label}: the level must survive"
                 );
             }
+        }
+    }
+
+    /// The iceberg arm of the same update keeps its pre-#230 outcome: a zero
+    /// quantity is **accepted**, leaving 0 visible / 20 hidden, because that
+    /// shape executes rather than vanishing (the hidden tranche is drawn into
+    /// visible on match). The rule narrowed to the non-auto reserve alone.
+    #[test]
+    fn test_update_order_iceberg_zero_quantity_accepts_and_leaves_hidden_intact() {
+        let book = tracked_book("ZERO-VIS-MODIFY-ICE");
+        let order_id = Id::new();
+        let rested = book.add_order(iceberg_buy(order_id, PRICE, VISIBLE, HIDDEN));
+        assert!(rested.is_ok(), "seeding must succeed: {rested:?}");
+
+        let updated = book.update_order(OrderUpdate::UpdateQuantity {
+            order_id,
+            new_quantity: Quantity::new(0),
+        });
+        assert!(
+            updated.is_ok(),
+            "a zero-quantity iceberg update stays accepted: {updated:?}"
+        );
+
+        match book.get_order(order_id) {
+            Some(order) => assert_eq!(
+                (
+                    order.visible_quantity().as_u64(),
+                    order.hidden_quantity().as_u64()
+                ),
+                (0, HIDDEN),
+                "the visible tranche is emptied and hidden is untouched"
+            ),
+            None => panic!("the iceberg must still rest"),
         }
     }
 
@@ -861,6 +1070,7 @@ mod tests_reserve_residual_policy {
                         visible_quantity,
                         crossable_quantity,
                         hidden_quantity,
+                        discarded_quantity,
                     }) => {
                         assert_eq!(order_id, maker_id, "{label}/{depth}: order id reported");
                         assert_eq!(
@@ -873,7 +1083,16 @@ mod tests_reserve_residual_policy {
                         );
                         assert_eq!(
                             hidden_quantity, HIDDEN,
-                            "{label}/{depth}: discarded hidden tranche reported"
+                            "{label}/{depth}: projected hidden tranche reported"
+                        );
+                        // What would actually be destroyed: the residual the
+                        // re-add would leave unmatched, `total - crossable`.
+                        // Depth 10 abandons all 20 hidden; depth 15 draws 5
+                        // out of hidden first and abandons 15.
+                        assert_eq!(
+                            discarded_quantity,
+                            SUBMITTED - depth,
+                            "{label}/{depth}: destroyed quantity reported"
                         );
                     }
                     other => panic!(

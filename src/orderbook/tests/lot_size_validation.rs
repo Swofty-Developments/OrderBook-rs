@@ -294,10 +294,12 @@ mod tests {
 
     // --- The narrowed symmetry ---
 
-    /// Iceberg and Reserve share *identical* visible / hidden validation. The
-    /// replenishment rule is Reserve-only, so the shared verdict is asserted
-    /// on a reserve that never transfers — `auto_replenish` off, which alone
-    /// switches the transfer check off (#230).
+    /// Iceberg and Reserve share *identical* **lot-size** validation. Two
+    /// Reserve-only rules break the symmetry and are asserted separately: the
+    /// replenishment transfer check (so the shared verdict is taken on a
+    /// reserve that never transfers, `auto_replenish` off), and the
+    /// zero-visible ghost rule, which applies to the non-auto reserve alone
+    /// (#230) and is asserted as an explicit divergence inside the loop.
     #[test]
     fn test_validate_order_shape_iceberg_and_reserve_share_tranche_verdicts() {
         let book = book_with_lot(10);
@@ -316,26 +318,36 @@ mod tests {
             let iceberg_verdict = book.validate_order_shape(&iceberg(visible, hidden));
             let reserve_verdict =
                 book.validate_order_shape(&reserve(visible, hidden, 0, None, false));
+
+            // The one deliberate asymmetry (#230). A zero visible tranche
+            // behind hidden depth is a ghost ONLY for a non-auto-replenishing
+            // reserve: `pricelevel` removes it without a trade and strands the
+            // hidden. The identical iceberg executes — its degenerate guard
+            // draws the whole hidden tranche into visible on match — so it
+            // stays admissible and the two kinds diverge here on purpose.
+            if visible == 0 && hidden > 0 {
+                assert!(
+                    iceberg_verdict.is_ok(),
+                    "{visible}/{hidden}: a zero-visible iceberg is executable, \
+                     so it must be accepted: {iceberg_verdict:?}"
+                );
+                match &reserve_verdict {
+                    Err(OrderBookError::ZeroVisibleTranche {
+                        hidden_quantity, ..
+                    }) => assert_eq!(
+                        *hidden_quantity, hidden,
+                        "{visible}/{hidden}: the stranded tranche is reported"
+                    ),
+                    other => panic!(
+                        "{visible}/{hidden}: a zero-visible non-auto reserve must be \
+                         rejected as a ghost, got {other:?}"
+                    ),
+                }
+                continue;
+            }
+
             match (&iceberg_verdict, &reserve_verdict) {
                 (Ok(()), Ok(())) => {}
-                // The zero-visible rule (#230) is shared by both kinds and
-                // runs before the lot check, so `(0, 20)` reaches the same
-                // verdict on either side.
-                (
-                    Err(OrderBookError::ZeroVisibleTranche {
-                        hidden_quantity: iceberg_hidden,
-                        ..
-                    }),
-                    Err(OrderBookError::ZeroVisibleTranche {
-                        hidden_quantity: reserve_hidden,
-                        ..
-                    }),
-                ) => {
-                    assert_eq!(
-                        iceberg_hidden, reserve_hidden,
-                        "{visible}/{hidden}: verdicts must name the same hidden tranche"
-                    );
-                }
                 (
                     Err(OrderBookError::InvalidLotSize {
                         quantity: iceberg_quantity,
