@@ -32,6 +32,113 @@
 //! - **Research**: Platform for studying market microstructure and order flow
 //! - **Educational**: Reference implementation for understanding modern exchange architecture
 //!
+//! ## What's New in Version 0.13.0
+//!
+//! ### v0.13.0 — the public API hands out no level handles (#228); exclusive submit gate under STP (#225)
+//!
+//! - **Breaking (semver-minor under 0.x): `OrderBook::get_bids` and
+//!   `OrderBook::get_asks` are removed (#228).** Both cloned the book's live
+//!   `Arc<PriceLevel>` handles into a `DashMap`, and `PriceLevel` exposes
+//!   `add_order`, `update_order` and `match_order` publicly, so a caller
+//!   holding one could mutate a price level behind the submit gate, the
+//!   `order_locations` / user-order indices, the risk state, self-trade
+//!   prevention, the kill switch, the order-state tracker and the trade /
+//!   book-change listeners. Deprecating them would have left the bypass
+//!   reachable, so they are gone and 0.13.0 is the release boundary for
+//!   breaking changes. Migrate to the read-only APIs, which return values
+//!   rather than handles: `create_snapshot(depth)` for a full snapshot of
+//!   every level and order; `levels_with_cumulative_depth`,
+//!   `levels_until_depth`, `levels_in_range` and `find_level` for `LevelInfo`
+//!   views; `order_count_at_price`, `get_orders_at_price`, `get_all_orders`
+//!   and `total_depth_at_levels` for per-price and per-book order data;
+//!   `best_bid` / `best_ask` for the top of book. Every level mutation now
+//!   goes through `OrderBook`.
+//! - **Breaking (semver-minor under 0.x): the level iterators' `new`
+//!   constructors are crate-private (#228).**
+//!   `LevelsWithCumulativeDepth::new`, `LevelsUntilDepth::new` and
+//!   `LevelsInRange::new` each take a reference to the book's live price-level
+//!   map, and with `get_bids` / `get_asks` gone no public API yields one. The
+//!   iterator types stay public; obtain them from
+//!   `OrderBook::levels_with_cumulative_depth`, `levels_until_depth` and
+//!   `levels_in_range`.
+//! - **Self-trade prevention holds under concurrent same-user admission
+//!   (#225).** An STP-relevant submit decided a price level's `STPAction`
+//!   from a queue snapshot and then filled that level in a second operation,
+//!   both under the *shared* side of the submit gate — so a concurrent
+//!   same-user admission could land between the two and be filled by the very
+//!   sweep the scan was protecting. STP-relevant submits and the
+//!   cancel-then-add modify variants whose re-add can match (`UpdatePrice`,
+//!   `UpdatePriceAndQuantity`, `Replace`) now take the **exclusive** side, so
+//!   the scan and the fill it authorises observe the same queue. Cost: on an
+//!   STP book every identified submit except post-only, and every
+//!   matching-capable re-price, is serialized. `STPMode::None` books,
+//!   post-only submits, `UpdateQuantity` and `Cancel` keep the shared, fully
+//!   concurrent path. With no level handles left to bypass it (#228), the
+//!   gate now covers every mutation.
+//! - **Reserve orders are lot-size validated per tranche and on their
+//!   replenishment transfer (#226).** A `ReserveOrder` used to be checked on
+//!   its **total** only, so a 15 visible / 5 hidden reserve was admitted to a
+//!   lot-10 book while the identical iceberg was rejected. It now takes the
+//!   iceberg's per-tranche rule and, additionally, validates the capped
+//!   quantity replenishment transfers from hidden into the visible tranche —
+//!   `min(replenish_amount.unwrap_or(DEFAULT_RESERVE_REPLENISH_AMOUNT),
+//!   hidden)`, checked while `hidden > 0` and `auto_replenish` is on.
+//!   Admission is strictly tighter: a shape previously admitted on its total
+//!   is now rejected with `InvalidLotSize`, carrying the offending tranche or
+//!   transfer.
+//! - **A reserve residual follows `auto_replenish` (#230).** The
+//!   residual-resting helper behind `OrderQuantity::set_total_remaining`
+//!   refreshed an emptied visible tranche from `replenish_amount` alone,
+//!   ignoring `auto_replenish`, falling back to a refresh of zero (which
+//!   could rest a zero-visible order) and never consulting
+//!   `replenish_threshold`. It now applies `pricelevel`'s rule: with
+//!   automatic replenishment on and hidden left, a visible tranche below
+//!   `max(replenish_threshold, 1)` grows by the explicit amount or
+//!   `DEFAULT_RESERVE_REPLENISH_AMOUNT`, capped by hidden; with it off the
+//!   residual does not rest at all and its hidden remainder is discarded,
+//!   mirroring the removal of a depleted non-auto maker. A 10 visible / 20
+//!   hidden reserve with `replenish_amount = Some(10)` and no automatic
+//!   replenishment, filled for 10, used to rest 10 / 10 and now ends as
+//!   `Filled { filled_quantity: 10 }`; the same order with automatic
+//!   replenishment and a threshold of 5, filled for 8, used to rest 2 / 20
+//!   and now rests 12 / 10. The accounting rule is
+//!   `submitted = executed + resting (visible + hidden) + discarded`, and
+//!   discarded quantity is never counted as executed. A discard emits an
+//!   `INFO` trace and, under the `metrics` feature, the new
+//!   `orderbook_reserve_discards_total` /
+//!   `orderbook_reserve_hidden_discarded_total` counters, carrying a `path`
+//!   field so the aggressive taker and the removed maker report the same
+//!   discard the same way; the returned order handle carries both tranches
+//!   at zero. Because the three
+//!   cancel-then-add modify variants re-add the order as a taker, a
+//!   validate-first pre-check now rejects a re-price that would exhaust such
+//!   a reserve's visible tranche with the new
+//!   `OrderBookError::ReserveResidualWouldBeDiscarded` **before** the
+//!   original is cancelled — a modify can never silently destroy the order
+//!   it modifies. Crossing into depth smaller than the visible tranche, and
+//!   a projected full fill, are both allowed through. `RejectReason` gains
+//!   the matching wire code 14; both enums are `#[non_exhaustive]`.
+//! - **A two-tranche order must display a positive visible tranche (#230).**
+//!   An iceberg or reserve with `visible_quantity == 0` behind
+//!   `hidden_quantity > 0` used to rest as a ghost: no visible depth,
+//!   unfillable, and removed by `pricelevel` with its whole hidden tranche
+//!   stranded on the first taker to reach the level. Since #221 a zero
+//!   quantity on `UpdateQuantity` / `UpdatePriceAndQuantity` / `Replace`
+//!   could drive a healthy resting order into that shape too.
+//!   `validate_order_shape` now rejects it with the new
+//!   `OrderBookError::ZeroVisibleTranche`, covering `add_order` and every
+//!   modify projection; a rejected modify leaves the original resting.
+//!   Single-tranche kinds are unaffected. Maps to the existing
+//!   `RejectReason::InvalidQuantity`.
+//! - **Reserve `UpdatePriceAndQuantity` honours the requested visible
+//!   quantity (#221).** `OrderQuantity::set_quantity` read a reserve's
+//!   argument as a **total** target and only ever reduced, so a requested
+//!   increase was silently dropped (a 30 / 70 reserve asked to move to 80
+//!   ended at 10 / 70) and a decrease was drawn across both tranches. It now
+//!   sets the **visible** tranche and leaves hidden untouched for both
+//!   two-tranche kinds, matching `UpdateQuantity`, `Replace` and the upstream
+//!   `pricelevel` contract.
+//!
 //! ## What's New in Version 0.12.0
 //!
 //! ### v0.12.0 — pricelevel 0.9 hardening bump; upsize demotion survives snapshot restore (#205)

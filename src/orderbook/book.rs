@@ -844,11 +844,13 @@ where
     /// its sweep see the same queue state, and a competing admission
     /// blocks here and runs against the post-decision state instead.
     ///
-    /// Scope limitation: mutation performed directly on the
-    /// `Arc<PriceLevel>` handles returned by
-    /// [`get_bids`](Self::get_bids) / [`get_asks`](Self::get_asks)
-    /// bypasses the gate entirely and is outside this guarantee (tracked
-    /// in #228).
+    /// Scope: the public API hands out no level handles — `get_bids` /
+    /// `get_asks`, which cloned the live `Arc<PriceLevel>`s and let a caller
+    /// mutate a level behind the gate, were removed in 0.13.0 (#228). Every
+    /// level mutation therefore goes through `OrderBook` and past this gate.
+    /// The read-only views (`create_snapshot`, the `LevelInfo` iterators,
+    /// `get_orders_at_price`, `best_bid` / `best_ask`, …) hand out values,
+    /// not handles.
     ///
     /// # Invariant: no nested acquisition
     ///
@@ -3782,30 +3784,6 @@ where
         (bid_volumes, ask_volumes)
     }
 
-    /// Get an Arc reference to the bids as a DashMap
-    ///
-    /// # Note
-    /// Creates a snapshot by collecting all entries into a DashMap
-    pub fn get_bids(&self) -> Arc<DashMap<u128, Arc<PriceLevel>>> {
-        let map = DashMap::new();
-        for entry in self.bids.iter() {
-            map.insert(*entry.key(), entry.value().clone());
-        }
-        Arc::new(map)
-    }
-
-    /// Get an Arc reference to the asks as a DashMap
-    ///
-    /// # Note
-    /// Creates a snapshot by collecting all entries into a DashMap
-    pub fn get_asks(&self) -> Arc<DashMap<u128, Arc<PriceLevel>>> {
-        let map = DashMap::new();
-        for entry in self.asks.iter() {
-            map.insert(*entry.key(), entry.value().clone());
-        }
-        Arc::new(map)
-    }
-
     /// Get a BTreeMap of bids with price as key and PriceLevel as value
     ///
     /// # Errors
@@ -3842,7 +3820,16 @@ where
             .collect()
     }
 
-    /// Get an Arc reference to the order_locations DashMap
+    /// Get a fresh copy of the order-location index, wrapped in an `Arc`.
+    ///
+    /// This is **not** a handle to the live map: the index is cloned
+    /// entry-by-entry and the `Arc` owns the copy, so later admissions,
+    /// cancels and modifies on this book are not reflected in it and writes
+    /// to it do not reach the book. Treat the result as a point-in-time
+    /// snapshot of `order id -> (price, side)`, and re-read it when a
+    /// current view is needed. Cost is proportional to the number of
+    /// resting orders.
+    #[must_use]
     pub fn get_order_locations_arc(&self) -> Arc<DashMap<Id, (u128, Side)>> {
         Arc::new(self.order_locations.clone())
     }

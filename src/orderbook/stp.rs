@@ -65,10 +65,10 @@ use serde::{Deserialize, Serialize};
 /// submits interleave between consecutive re-prices, and a peg repriced
 /// early in the sweep can be filled before a later one is even evaluated.
 ///
-/// The guarantee covers mutations performed through the `OrderBook` API.
-/// Mutation applied directly to the `Arc<PriceLevel>` handles returned by
-/// `OrderBook::get_bids` / `OrderBook::get_asks` bypasses the gate and is
-/// outside it (tracked in #228).
+/// The guarantee covers every mutation, because the public API hands out no
+/// level handles: `OrderBook::get_bids` / `get_asks`, which cloned the live
+/// `Arc<PriceLevel>`s and let a caller mutate a level behind the gate, were
+/// removed in 0.13.0 (#228). Every level mutation goes through `OrderBook`.
 ///
 /// [`STPMode::None`] books are unaffected: with no STP scan there is no
 /// window to protect, and their submits keep the shared, fully concurrent

@@ -151,13 +151,42 @@ println!("Average price: {}", result.average_price());
   not on the total: a 15 visible / 5 hidden split is rejected on a lot-10
   book even though its total of 20 is a whole multiple. A Reserve order is
   additionally validated on the quantity its replenishment would move into
-  the visible tranche, capped by the hidden tranche:
-  `min(replenish_amount, hidden)` when an explicit amount is set;
-  `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, hidden)` when there is no explicit
-  amount and `auto_replenish` is on; nothing otherwise, and nothing when the
-  order carries no hidden tranche. `replenish_threshold` is unrestricted.
-  Rejections return `OrderBookError::InvalidLotSize` naming the offending
-  quantity
+  the visible tranche, capped by the hidden tranche. That check applies only
+  while `auto_replenish` is on, the single flag that decides whether anything
+  is ever transferred: `min(replenish_amount, hidden)` when an explicit
+  amount is set; `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, hidden)` when there
+  is none. With `auto_replenish` off nothing is ever transferred and no
+  check applies, whatever `replenish_amount` says; nothing is checked either
+  when the order carries no hidden tranche. `replenish_threshold` is
+  unrestricted. Rejections return `OrderBookError::InvalidLotSize` naming the
+  offending quantity
+- An Iceberg or Reserve order must display a positive visible tranche: a
+  `visible_quantity` of 0 behind a non-empty `hidden_quantity` is rejected
+  with `OrderBookError::ZeroVisibleTranche`, on `add_order` and on every
+  quantity-carrying modify (`UpdateQuantity`, `UpdatePriceAndQuantity`,
+  `Replace`, all of which set the visible tranche). Such an order would show
+  no depth, never fill, and lose its whole hidden tranche to the first taker
+  that reached its level
+- An aggressive two-tranche order sweeps with its **total**, not with its
+  visible tranche: a 10 visible / 20 hidden Reserve submitted into 20 units
+  of contra liquidity executes 20. What its unmatched residual does follows
+  `auto_replenish`. With it on and hidden left, a visible tranche the sweep
+  left below `max(replenish_threshold, 1)` — an emptied one always is — is
+  refreshed from hidden (the explicit `replenish_amount`, or
+  `DEFAULT_RESERVE_REPLENISH_AMOUNT` when there is none, capped by hidden)
+  and the residual rests. With it off the residual does not rest at all: its
+  hidden remainder is discarded and the order ends as
+  `OrderStatus::Filled { filled_quantity }` carrying only what executed,
+  mirroring the resting side, where `pricelevel` removes a depleted
+  non-replenishing maker and strands its hidden tranche. The accounting rule
+  holds in every case, and discarded quantity is never counted as executed:
+  `submitted = executed + resting (visible + hidden) + discarded`
+- The default refresh is capped by the hidden tranche, not by the size the
+  order first displayed, so a residual can rest showing more than it
+  originally showed: that 10 visible / 20 hidden Reserve with no explicit
+  `replenish_amount` and `auto_replenish` on, filled for 10, refreshes with
+  `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, 20) = 20` and rests 20 visible / 0
+  hidden. Set an explicit `replenish_amount` to pin the displayed size
 
 **Time-In-Force:**
 - `Gtc` (Good-Till-Cancel): Remain until filled or cancelled
@@ -259,7 +288,15 @@ instead. Shape validation (tick size, lot size, `visible + hidden`
 representability) and the risk gate run on the projected order, and the
 min / max order size limits apply to its `visible + hidden` total, so an
 update can be rejected for a size larger than the quantity you passed.
-These pre-admission rejections leave the original order unchanged.
+A cancel-then-add modify (`UpdatePrice`, `UpdatePriceAndQuantity`,
+`Replace`) of a Reserve order with `auto_replenish` off and a non-empty
+hidden tranche is additionally rejected with
+`OrderBookError::ReserveResidualWouldBeDiscarded` when the projected price
+would cross into at least its visible tranche but less than its total,
+because the re-added order's residual would not rest and its hidden
+remainder would be destroyed; a projected full fill is allowed, and so is a
+re-price that crosses less than the visible tranche. These pre-admission
+rejections leave the original order unchanged.
 
 ### Cancelling Orders
 
@@ -692,14 +729,24 @@ only through the match-only entry points (`match_order_with_user`,
 enabled, so mixing anonymous and identified flow does not preserve submit
 concurrency on an STP book.
 
-**Scope.** The guarantee covers every mutation made through the
-`OrderBook` API: the submit, cancel, modify, mass-cancel and market-sweep
-entry points listed above, plus snapshot restores. One thing sits
-outside it, and one thing is worth spelling out:
+**Scope.** The guarantee covers every mutation: the submit, cancel,
+modify, mass-cancel and market-sweep entry points listed above, plus
+snapshot restores. Nothing sits outside it; two things are worth
+spelling out:
 
-- `get_bids()` / `get_asks()` hand out `Arc<PriceLevel>` handles; mutating a
-  level through one of those handles bypasses the gate entirely (tracked in
-  issue #228). Use them for reading only.
+- The public API hands out no level handles. `get_bids()` / `get_asks()`
+  cloned the live `Arc<PriceLevel>` handles, and `PriceLevel` exposes
+  `add_order`, `update_order` and `match_order` publicly, so a caller could
+  mutate a level behind the gate — and behind the indices, the risk state,
+  STP, the kill switch, the order-state tracker and the listeners. Both were
+  removed in 0.13.0 (issue #228); every level mutation now goes through
+  `OrderBook`. Read a level's contents through the value-returning APIs
+  instead: `create_snapshot(depth)` for a full snapshot of every level and
+  order; `levels_with_cumulative_depth`, `levels_until_depth`,
+  `levels_in_range` and `find_level` for `LevelInfo` views;
+  `order_count_at_price`, `get_orders_at_price`, `get_all_orders` and
+  `total_depth_at_levels` for per-price / per-book order data; `best_bid` /
+  `best_ask` for the top of book.
 - Snapshot restores are covered: the live `restore_from_snapshot(&self)`
   takes the exclusive side of the gate for its commit phase, and the
   `&mut self` package / JSON restores are exclusive by construction.
