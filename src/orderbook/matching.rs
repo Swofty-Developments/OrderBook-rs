@@ -225,6 +225,24 @@ impl StopCondition {
             Self::QuoteAmount { remaining } => *remaining == 0,
         }
     }
+
+    /// Whether the remaining budget is quote-notional dust at `level_price`:
+    /// nonzero, but unable to fund one more lot at that price.
+    ///
+    /// Only the notional arm is walked past on the STP-cancelling paths. A
+    /// base-quantity residual, whatever its size, is the taker's own
+    /// quantity still unfilled at a level holding its own maker; walked
+    /// past, it would rest crossed against that maker (a maker admitted
+    /// before a lot-size change keeps resting with a misaligned tranche —
+    /// see `set_lot_size` — so a sub-lot residual is reachable), so the
+    /// base arm keeps the STP verdict. A
+    /// notional taker never rests, and its dust at one price can still
+    /// fund a whole lot at a cheaper level, so it walks on instead.
+    #[inline]
+    #[must_use]
+    fn is_dust_at(&self, level_price: u128, lot: u64) -> bool {
+        matches!(self, Self::QuoteAmount { .. }) && self.level_qty_cap(level_price, lot) == 0
+    }
 }
 
 impl<T> OrderBook<T>
@@ -609,24 +627,26 @@ where
                         }
                         // Reachability: the same-user maker is only reached
                         // if the taker can still execute at this price after
-                        // the non-self depth in front of it. Two ways it
-                        // cannot. A budget the pre-match exhausted is an
-                        // ordinary complete fill. A residual that cannot fund
-                        // one more lot at this price never executes here
-                        // either — `is_done()` is exact zero, and a
-                        // quote-amount budget normally ends in dust below one
-                        // unit rather than at zero — so the maker is
-                        // unreachable and survives; but that residual is not
-                        // necessarily dead: a quote-amount sell can still
-                        // afford a whole lot at a cheaper bid further down,
-                        // so walk on rather than break (for a buy the next
-                        // ask is dearer and the loop's own cap check ends the
-                        // sweep). `check_modify_stp_self_cross` dry-runs the
-                        // same decision on the modify path (#168).
+                        // the non-self depth in front of it. A budget the
+                        // pre-match exhausted is an ordinary complete fill.
+                        // Quote-notional dust — a residual that cannot fund
+                        // one more unit at this price, the usual end of a
+                        // notional sweep since `is_done()` is exact zero —
+                        // cannot execute here either, so the maker is
+                        // unreachable and survives, and the sweep walks on
+                        // rather than breaking: a notional sell can still
+                        // afford a whole lot at a cheaper bid (for a buy the
+                        // next ask is dearer and the loop's own cap check
+                        // ends the sweep). A base-quantity residual keeps
+                        // the STP verdict whatever its size: walked past, it
+                        // would rest crossed against the same-user maker
+                        // (see `StopCondition::is_dust_at`).
+                        // `check_modify_stp_self_cross` dry-runs the same
+                        // decision on the modify path (#168).
                         if stop.is_done() {
                             break;
                         }
-                        if stop.level_qty_cap(price, lot) == 0 {
+                        if stop.is_dust_at(price, lot) {
                             continue;
                         }
                         stp_taker_cancelled = true;
@@ -709,12 +729,13 @@ where
                         // Same reachability rule as `CancelTaker` above, and
                         // here it also gates the maker cancellation: a maker
                         // the taker never reached must survive untouched,
-                        // whether the budget is spent or only dust below one
-                        // lot at this price is left.
+                        // whether the budget is spent or only quote-notional
+                        // dust is left at this price. A base-quantity
+                        // residual still cancels both.
                         if stop.is_done() {
                             break;
                         }
-                        if stop.level_qty_cap(price, lot) == 0 {
+                        if stop.is_dust_at(price, lot) {
                             continue;
                         }
                         // Cancel the maker on the held level for the same lockstep

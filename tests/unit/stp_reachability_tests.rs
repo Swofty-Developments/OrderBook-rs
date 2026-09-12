@@ -3,19 +3,24 @@
 //! `check_stp_at_level` reports a conflict whenever a same-user maker rests
 //! at a crossed level, but the taker only self-trades if it can still
 //! execute at that price after consuming the non-self depth in front of
-//! that maker. The `CancelTaker` / `CancelBoth` arms cancel only when the
-//! residual can fund another lot at the level: a spent budget is a complete
-//! fill, and quote-amount dust below one unit leaves the maker untouched
-//! and walks on to the next level, where a cheaper bid may still be
-//! affordable. `check_modify_stp_self_cross` applies the same per-level
-//! FIFO rule on the modify path.
+//! that maker. A spent budget is a complete fill, and quote-notional dust
+//! below one unit leaves the maker untouched and walks on to the next
+//! level, where a cheaper bid may still be affordable. A base-quantity
+//! residual keeps the STP verdict whatever its size, since walked past it
+//! would rest crossed against the taker's own maker.
+//! `check_modify_stp_self_cross` applies the same per-level FIFO rule on
+//! the modify path.
 
 #[cfg(test)]
 mod tests_stp_reachability {
     use orderbook_rs::orderbook::order_state::{CancelReason, OrderStateTracker, OrderStatus};
     use orderbook_rs::orderbook::stp::STPMode;
     use orderbook_rs::{DefaultOrderBook, OrderBook, OrderBookError, TradeResult};
-    use pricelevel::{Hash32, Id, MatchResult, OrderUpdate, Price, Side, TimeInForce};
+    use pricelevel::{
+        Hash32, Id, MatchResult, OrderType, OrderUpdate, Price, Quantity, Side, TimeInForce,
+        TimestampMs,
+    };
+    use std::num::NonZeroU64;
 
     const PRICE: u128 = 100;
     /// Ahead in the queue and owned by someone else: reachable depth.
@@ -195,8 +200,9 @@ mod tests_stp_reachability {
         assert_self_maker_intact(&book);
     }
 
-    /// A market taker takes the same path with the STP flag dropped, so
-    /// `CancelBoth` cancelled the maker while returning `Ok`.
+    /// A market taker takes the same path with the STP flag dropped, so an
+    /// unreachable maker used to be cancelled under `CancelBoth` while the
+    /// caller saw `Ok`. The maker must survive untouched.
     #[test]
     fn market_cancel_both_leaves_unreachable_maker_intact() {
         let book = book_with_self_maker_behind(STPMode::CancelBoth);
@@ -540,5 +546,111 @@ mod tests_stp_reachability {
                 ),
             }
         }
+    }
+
+    /// A non-self reserve showing 3 (hidden 2) ahead of the same-user
+    /// maker, on a book whose lot size becomes 5 after both rest. #226
+    /// validates reserve tranches per lot on admission, but a maker that is
+    /// already resting keeps its misaligned tranche when the lot changes
+    /// (documented on `set_lot_size`), so a base-quantity taker of 5 fills
+    /// 3 and is left with 2 in front of its own maker.
+    fn book_with_sub_lot_reserve_ahead(mode: STPMode, auto_replenish: bool) -> OrderBook<()> {
+        let mut book: OrderBook<()> = DefaultOrderBook::new("STPV");
+        book.set_stp_mode(mode);
+        book.set_order_state_tracker(OrderStateTracker::new());
+        book.add_order(OrderType::ReserveOrder {
+            id: Id::from_u64(OTHER_MAKER),
+            price: Price::new(PRICE),
+            visible_quantity: Quantity::new(3),
+            hidden_quantity: Quantity::new(2),
+            side: Side::Sell,
+            user_id: user(2),
+            timestamp: TimestampMs::new(0),
+            time_in_force: TimeInForce::Gtc,
+            replenish_threshold: Quantity::new(1),
+            replenish_amount: Some(NonZeroU64::new(2).expect("nonzero")),
+            auto_replenish,
+            extra_fields: (),
+        })
+        .expect("seed reserve before the lot size is set");
+        book.add_limit_order_with_user(
+            Id::from_u64(SELF_MAKER),
+            PRICE,
+            5,
+            Side::Sell,
+            TimeInForce::Gtc,
+            user(1),
+            None,
+        )
+        .expect("seed same-user maker");
+        book.set_lot_size(5);
+        book
+    }
+
+    /// A base-quantity residual is not dust the sweep may walk past: rested,
+    /// the 2 left over would cross the taker's own maker at this price and
+    /// sit misaligned on the new lot. The
+    /// STP verdict stands — the taker is cancelled with its true fill and
+    /// nothing rests — and `CancelBoth` still takes the maker with it.
+    #[test]
+    fn base_quantity_residual_behind_a_sub_lot_reserve_keeps_the_stp_verdict() {
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let book = book_with_sub_lot_reserve_ahead(mode, true);
+
+            let err = book
+                .add_limit_order_with_user(
+                    Id::from_u64(TAKER),
+                    PRICE,
+                    5,
+                    Side::Buy,
+                    TimeInForce::Gtc,
+                    user(1),
+                    None,
+                )
+                .expect_err("the residual reaches the same-user maker");
+            assert!(
+                matches!(err, OrderBookError::SelfTradePrevented { .. }),
+                "{mode}: expected SelfTradePrevented, got {err:?}"
+            );
+            assert_eq!(
+                book.order_status(Id::from_u64(TAKER)),
+                Some(OrderStatus::Cancelled {
+                    filled_quantity: 3,
+                    reason: CancelReason::SelfTradePrevention,
+                }),
+                "{mode}: taker cancelled with its true non-self fill"
+            );
+            assert!(
+                book.get_order(Id::from_u64(TAKER)).is_none() && book.best_bid().is_none(),
+                "{mode}: no sub-lot residual rests crossed against the taker's own maker"
+            );
+            match mode {
+                STPMode::CancelBoth => assert!(
+                    book.get_order(Id::from_u64(SELF_MAKER)).is_none(),
+                    "CancelBoth cancels the reached maker"
+                ),
+                _ => assert_eq!(
+                    book.get_order(Id::from_u64(SELF_MAKER))
+                        .expect("CancelTaker leaves the maker resting")
+                        .visible_quantity()
+                        .as_u64(),
+                    5
+                ),
+            }
+        }
+    }
+
+    fn assert_self_maker_intact_at(book: &OrderBook<()>, visible: u64) {
+        let maker = book
+            .get_order(Id::from_u64(SELF_MAKER))
+            .expect("same-user maker still rests");
+        assert_eq!(maker.visible_quantity().as_u64(), visible);
+        assert!(
+            !matches!(
+                book.order_status(Id::from_u64(SELF_MAKER)),
+                Some(OrderStatus::Cancelled { .. })
+            ),
+            "no cancel recorded for an unreachable maker"
+        );
     }
 }
