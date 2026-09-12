@@ -4,7 +4,9 @@
 //! only checked on its *total*, so a 15 visible / 5 hidden reserve slipped
 //! into a lot-10 book while the identical iceberg was rejected. The reserve
 //! now takes the iceberg's per-tranche rule plus a check on the capped
-//! transfer that replenishment moves from hidden into the visible tranche.
+//! transfer that replenishment moves from hidden into the visible tranche —
+//! the latter only while `auto_replenish` is on, the single flag that
+//! decides whether anything is ever transferred (#230).
 
 #[cfg(test)]
 mod tests {
@@ -117,18 +119,24 @@ mod tests {
 
     // --- Reserve: the capped replenishment transfer ---
 
-    /// An explicit replenish amount is validated whatever `auto_replenish`
-    /// says: the residual-resting helper refreshes with it regardless. A
-    /// 10/20 reserve replenishing 7 would otherwise rest as 7/13.
+    /// An explicit replenish amount is dead configuration without
+    /// `auto_replenish` (#230): nothing is ever transferred on either path —
+    /// `pricelevel` removes a depleted resting maker and the residual helper
+    /// leaves the visible tranche empty, which ends the order — so the
+    /// misaligned 7 cannot reach a level and the order is accepted.
     #[test]
-    fn test_validate_order_shape_reserve_misaligned_replenish_amount_rejects() {
+    fn test_validate_order_shape_reserve_misaligned_replenish_amount_without_auto_accepts() {
         let book = book_with_lot(10);
         let result = book.validate_order_shape(&reserve(10, 20, 0, Some(7), false));
-        assert_invalid_lot(result, 7, 10);
+        assert!(
+            result.is_ok(),
+            "non-replenishing reserve rejected on a dead amount: {result:?}"
+        );
     }
 
-    /// The same amount is rejected with `auto_replenish` on, where it is
-    /// `pricelevel`'s transfer as well.
+    /// The same amount is rejected with `auto_replenish` on, where it is the
+    /// transfer both `pricelevel` and the residual helper perform: a 10/20
+    /// reserve replenishing 7 would otherwise rest as 7/13.
     #[test]
     fn test_validate_order_shape_reserve_misaligned_replenish_amount_auto_rejects() {
         let book = book_with_lot(10);
@@ -142,7 +150,7 @@ mod tests {
     #[test]
     fn test_validate_order_shape_reserve_replenish_amount_capped_by_hidden_accepts() {
         let book = book_with_lot(10);
-        let result = book.validate_order_shape(&reserve(10, 20, 0, Some(25), false));
+        let result = book.validate_order_shape(&reserve(10, 20, 0, Some(25), true));
         assert!(result.is_ok(), "capped transfer rejected: {result:?}");
     }
 
@@ -288,7 +296,8 @@ mod tests {
 
     /// Iceberg and Reserve share *identical* visible / hidden validation. The
     /// replenishment rule is Reserve-only, so the shared verdict is asserted
-    /// on a reserve that never transfers (`None` amount, no auto-replenish).
+    /// on a reserve that never transfers — `auto_replenish` off, which alone
+    /// switches the transfer check off (#230).
     #[test]
     fn test_validate_order_shape_iceberg_and_reserve_share_tranche_verdicts() {
         let book = book_with_lot(10);
@@ -309,6 +318,24 @@ mod tests {
                 book.validate_order_shape(&reserve(visible, hidden, 0, None, false));
             match (&iceberg_verdict, &reserve_verdict) {
                 (Ok(()), Ok(())) => {}
+                // The zero-visible rule (#230) is shared by both kinds and
+                // runs before the lot check, so `(0, 20)` reaches the same
+                // verdict on either side.
+                (
+                    Err(OrderBookError::ZeroVisibleTranche {
+                        hidden_quantity: iceberg_hidden,
+                        ..
+                    }),
+                    Err(OrderBookError::ZeroVisibleTranche {
+                        hidden_quantity: reserve_hidden,
+                        ..
+                    }),
+                ) => {
+                    assert_eq!(
+                        iceberg_hidden, reserve_hidden,
+                        "{visible}/{hidden}: verdicts must name the same hidden tranche"
+                    );
+                }
                 (
                     Err(OrderBookError::InvalidLotSize {
                         quantity: iceberg_quantity,
