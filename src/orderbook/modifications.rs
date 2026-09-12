@@ -216,10 +216,12 @@ fn reduce_reserve_to_total<T>(order: &mut OrderType<T>, new_total_quantity: u64)
         *visible_quantity = Quantity::new(vis.saturating_sub(filled_from_visible));
 
         let remaining_to_reduce = amount_to_reduce - filled_from_visible;
-        // Hidden may only ever DECREASE here: the #226 lot-size admission
-        // check validates the replenishment transfer once, against the
-        // hidden tranche as submitted, and `min(amount, hidden)` stays
-        // lot-aligned only while hidden never grows.
+        // Hidden may only ever DECREASE here, and only by a lot-aligned
+        // amount (the executed remainder is lot-rounded by the sweep): the
+        // #226 lot-size admission check validates the replenishment transfer
+        // once, against the hidden tranche as submitted, and
+        // `min(amount, hidden)` stays lot-aligned only while hidden stays
+        // lot-aligned and never grows.
         *hidden_quantity =
             Quantity::new(hidden_quantity.as_u64().saturating_sub(remaining_to_reduce));
 
@@ -238,7 +240,7 @@ fn reduce_reserve_to_total<T>(order: &mut OrderType<T>, new_total_quantity: u64)
                 .unwrap_or(0)
                 .min(hidden_quantity.as_u64());
             *visible_quantity = Quantity::new(refresh);
-            // Decrease only, for the same reason as above.
+            // Decrease only, by the validated lot-aligned transfer, for the same reason as above.
             *hidden_quantity = Quantity::new(hidden_quantity.as_u64().saturating_sub(refresh));
         }
     }
@@ -1077,24 +1079,29 @@ where
     /// against the visible tranche, never transferred, so a non-aligned
     /// threshold cannot produce a non-aligned quantity.
     ///
-    /// Validating the transfer **once, at admission** is sound because
-    /// `hidden_quantity` is monotone non-increasing for an admitted order:
-    /// fills, [`reduce_reserve_to_total`] and `pricelevel`'s
-    /// `new_hidden = hidden − replenish_qty` only ever shrink it, and the
-    /// quantity-rewriting paths (`with_reduced_quantity`,
+    /// Validating the transfer **once, at admission** is sound because the
+    /// hidden tranche of an admitted order stays **lot-aligned and never
+    /// increases**: fills, [`reduce_reserve_to_total`] and `pricelevel`'s
+    /// `new_hidden = hidden − replenish_qty` only ever shrink it, each by a
+    /// lot-aligned amount (a lot-rounded fill or a validated transfer), and
+    /// the quantity-rewriting paths (`with_reduced_quantity`,
     /// [`OrderQuantity::set_quantity`], `OrderUpdate::Replace`) touch the
-    /// *visible* tranche only. A cap that holds at admission therefore keeps
-    /// holding: `min(amount, hidden)` can only move further down toward
-    /// `hidden`, which was itself validated as lot-aligned.
+    /// *visible* tranche only. Monotonicity alone would not do: the cap
+    /// `min(amount, hidden)` is lot-aligned only because both operands are,
+    /// so the alignment of `hidden` must be preserved as it shrinks. A cap
+    /// that holds at admission therefore keeps holding.
     ///
-    /// One intended consequence: on a lot size that does not divide
-    /// [`DEFAULT_RESERVE_REPLENISH_AMOUNT`] (100, 25, 30, 60, 3, …) a reserve
-    /// order that relies on the default amount — `replenish_amount == None`
-    /// with `auto_replenish == true` — is inadmissible whenever it carries
-    /// hidden depth: hidden is at least one lot, so the capped transfer is
-    /// exactly the default (80) and the order is rejected with
-    /// `InvalidLotSize { quantity: 80, .. }`. Such books must set an explicit
-    /// lot-aligned `replenish_amount`.
+    /// One intended consequence follows from the cap. A reserve order that
+    /// relies on the default amount — `replenish_amount == None` with
+    /// `auto_replenish == true` — is validated on
+    /// `min(`[`DEFAULT_RESERVE_REPLENISH_AMOUNT`]`, hidden)`. While
+    /// `hidden < 80` that transfer is the lot-aligned hidden tranche itself
+    /// and the order is admitted (lot 25: 25 visible / 50 hidden passes,
+    /// `min(80, 50) = 50`). Once `hidden >= 80` the transfer is exactly the
+    /// default, so on a lot size that does not divide 80 (100, 25, 30, 60,
+    /// 3, …) the order is rejected with `InvalidLotSize { quantity: 80, .. }`
+    /// (lot 25: 25 / 100 fails). Such books must set an explicit lot-aligned
+    /// `replenish_amount` for larger hidden tranches.
     ///
     /// Iceberg and Reserve therefore share identical visible / hidden
     /// validation, while Reserve additionally validates its applicable

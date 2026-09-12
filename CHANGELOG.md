@@ -50,9 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries the lot size; snapshot restoration does not run
   `validate_order_shape`, so a legacy snapshot may still hold orders that
   would now fail admission. Such a legacy order — restored from a snapshot,
-  or orphaned by a later `set_lot_size` — is not only inadmissible but
-  unmodifiable: `UpdateQuantity` cannot rewrite the hidden tranche and the
-  cancel-then-add variants re-validate the projected order, so it has to be
+  or orphaned by a later `set_lot_size` — can be repaired through
+  `UpdateQuantity`, `UpdatePriceAndQuantity` or `Replace` when only its
+  visible tranche is misaligned (a 15 / 20 reserve on a new lot of 10
+  becomes 20 / 20, since every quantity-carrying update re-validates the
+  projected order); when its hidden tranche or its replenishment
+  configuration is what fails, no update can correct it and it must be
   cancelled and re-submitted with aligned tranches. No public API, snapshot
   format or
   `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` change, and replenishment behaviour
