@@ -3,6 +3,7 @@ mod depth_analysis;
 mod enriched_snapshot_tests;
 mod error;
 mod iterator_tests;
+mod lot_size_validation;
 mod market_impact_tests;
 mod market_metrics;
 mod matching;
