@@ -391,6 +391,105 @@ move by a similar factor. Restoring submit concurrency on STP books
 needs the per-level STP-aware match in pricelevel, tracked as a
 follow-up; the book-level gate is the correctness fix.
 
+### `reserve_sweep` — IOC probes into reserve makers, strandable vs replenishing (added for #230)
+
+`reserve_sweep_hdr` measures `capture_strandable_makers` (#230). Each
+sweep in `match_order_inner` reads `non_auto_reserve_rested` (a
+monotonic per-book flag set at admission) exactly once, before any
+level is touched. On a book that has never rested a
+non-auto-replenishing `ReserveOrder` with hidden depth, that single
+relaxed atomic load is the sweep's entire cost: no pool buffer is
+acquired, `capture_strandable_makers` is never called for any level,
+and the post-sweep drain does no lookup. Only when the flag is true
+does each matched level get checked, and, if it still holds hidden
+depth, walked with `PriceLevel::iter_orders()` to record which resting
+non-auto reserves have hidden quantity behind them, so a sweep can
+report the hidden depth it strands when `pricelevel` drops a depleted
+maker's hidden tranche instead of refreshing it. `iter_orders` is
+`DashMap::iter` upstream, which read-locks every shard of the map
+regardless of how few orders rest at the level, so the walk is not
+free on any level holding hidden depth.
+
+Same book geometry as `thin_book_sweep`: 3 resting asks refilled every
+5 ops (not timed), 200 000 IOC buy probes with qty `1..=20` against
+them. The only difference from `thin_book_sweep` is that the resting
+side is `OrderType::ReserveOrder` (visible `1..=5`, hidden `4..=12`,
+`replenish_threshold: 0`) instead of plain limits. Two scenarios, run
+back to back on fresh books:
+
+- `reserve_sweep_nonauto` (`auto_replenish: false`): every resting
+  maker is strandable, so `non_auto_reserve_rested` flips true on the
+  first rest and every level-match that still holds hidden depth pays
+  the `iter_orders()` walk. This is the scenario `capture_strandable_makers`
+  adds cost to.
+- `reserve_sweep_auto` (`auto_replenish: true`): hidden depth still
+  rests and is still consumed, but nothing is strandable, so this book
+  never sets `non_auto_reserve_rested`. Each sweep pays the one hoisted
+  atomic load and nothing else; `capture_strandable_makers` is never
+  called.
+
+**`reserve_sweep_nonauto`** (`auto_replenish: false`; every resting
+maker is strandable, so the capture runs on the branch):
+
+| Quantile | `main` (no #230) | branch (#230) |
+|---|---|---|
+| p50    | 83 ns | 83 ns |
+| p99    | 4 543 ns | 6 959 ns |
+| p99.9  | 6 503 ns | 9 543 ns |
+| p99.99 | 8 711 ns | 11 839 ns |
+
+**`reserve_sweep_auto`** (`auto_replenish: true`; hidden depth rests
+but nothing is strandable, so the branch never arms
+`non_auto_reserve_rested`):
+
+| Quantile | `main` (no #230) | branch (#230) |
+|---|---|---|
+| p50    | 917 ns | 916 ns |
+| p99    | 3 917 ns | 3 793 ns |
+| p99.9  | 5 335 ns | 5 127 ns |
+| p99.99 | 6 503 ns | 6 211 ns |
+
+Medians of three runs per side, runs interleaved base/branch, `main`
+at `b821df2` (`orderbook-rs` 0.12.1) against this branch
+(`orderbook-rs` 0.13.0), both on `pricelevel` 0.9.1 with `Cargo.lock`
+aligned. Host: Apple M-series, 16 cores, macOS Darwin 25.6.0, `arm64`,
+rustc stable, 200 000 probes per scenario per run. Run-to-run spread
+was negligible at p50 and widened toward the tail on both `main` and
+the branch alike (p99.99 on either side roughly doubled between its
+lowest and highest of the three runs), consistent with ordinary
+single-sample tail jitter at 200 000 probes rather than anything
+specific to this comparison.
+
+**What the comparison shows.** In `reserve_sweep_nonauto`, where the
+capture runs, the branch adds roughly 2.4 µs at p99 (4 543 ns →
+6 959 ns) and roughly 3 µs at p99.9 (6 503 ns → 9 543 ns) over `main`
+on this workload: every probe that matches a level holding hidden
+depth pays a shard-locked `DashMap` pass over that level's resting
+orders, and `iter_orders` read-locks every shard regardless of how few
+orders rest there. In `reserve_sweep_auto`, where the flag never arms,
+`main` and the branch are unchanged within run-to-run noise, exactly
+as intended: the guard confines its cost to books that can actually
+strand something. p50 is unchanged between `main` and the branch in
+both scenarios, because most probes in this thin, frequently-refilled
+book either find nothing resting or take the cheap early-exit path
+before any level walk would matter.
+
+Separately, `reserve_sweep_auto`'s p50 (`~916` ns) sits well above
+`reserve_sweep_nonauto`'s (`83` ns) on **both** `main` and the branch:
+a non-auto reserve maker is fully consumed and removed after one or
+two probes and the book then sits empty until the next refill, while
+an auto-replenishing maker keeps refilling from hidden and stays
+matchable across most of the refill window, so more of the 200 000
+probes do real matching work against it. `main` shows the identical
+gap, so this is a `pricelevel` matching-cost difference between the
+two reserve behaviours, not anything #230 adds; it is why each
+scenario is compared against its own `main` baseline above rather than
+against the other scenario.
+
+Like every scenario in this suite, this is **closed-loop, per-probe
+service time**: see "Coordinated omission" above; it under-reports the
+queueing delay a saturated real load generator would see.
+
 ## 0.11.0 → 0.12.0 delta
 
 The 0.12.0 release combines the pricelevel 0.9 hardening upgrade with
