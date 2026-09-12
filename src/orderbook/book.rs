@@ -97,6 +97,24 @@ pub struct OrderBook<T = ()> {
     /// Flag indicating if there was a trade
     pub(super) has_traded: AtomicBool,
 
+    /// `true` once a `ReserveOrder { auto_replenish: false, .. }` carrying
+    /// hidden quantity has been rested on this book (#230).
+    ///
+    /// Gates the pre-match scan that captures makers whose hidden depth a
+    /// sweep would strand: on a book that never rested one, the scan can
+    /// never report anything, and skipping it keeps the sweep off
+    /// `PriceLevel::iter_orders`, whose `DashMap` iterator read-locks every
+    /// shard per level match. `match_order_inner` reads this once per sweep
+    /// and, when it is false, allocates no capture buffer and runs no
+    /// per-level capture at all.
+    ///
+    /// **Monotonic: set, never cleared.** Clearing it would require exact
+    /// removal bookkeeping across cancel, mass cancel, expiry, self-trade
+    /// prevention and restore; a stale `true` only costs the scan, while a
+    /// stale `false` would silently drop a discard report. Not part of the
+    /// snapshot format: a restore re-derives it from the orders it installs.
+    pub(super) non_auto_reserve_rested: AtomicBool,
+
     /// The timestamp of market close, if applicable (for DAY orders)
     pub(super) market_close_timestamp: AtomicU64,
 
@@ -483,6 +501,7 @@ where
             risk_state: RiskState::new(),
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
+            non_auto_reserve_rested: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -1034,6 +1053,7 @@ where
             risk_state: RiskState::new(),
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
+            non_auto_reserve_rested: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -1085,6 +1105,7 @@ where
             risk_state: RiskState::new(),
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
+            non_auto_reserve_rested: AtomicBool::new(false),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
@@ -3548,6 +3569,12 @@ where
                 for order in &level_orders {
                     self.order_locations.insert(order.id(), (*price, side));
                     self.track_user_order(order.user_id(), order.id());
+                    // #230: the flag is not carried by the snapshot; it is
+                    // re-derived from what the restore actually installs, so
+                    // a restored non-auto reserve keeps its discard
+                    // reportable. Monotonic, so the pre-restore value is
+                    // deliberately left alone rather than reset above.
+                    self.note_rested_order(order.as_ref());
                     #[cfg(feature = "special_orders")]
                     self.reregister_special_order(order.as_ref());
                     if rebuild_risk {
@@ -3570,6 +3597,29 @@ where
         };
         rebuild_side(&prepared.bids, Side::Buy);
         rebuild_side(&prepared.asks, Side::Sell);
+    }
+
+    /// Flag the book when `order` is a two-tranche reserve that will strand
+    /// hidden quantity if a sweep exhausts its visible tranche (#230): a
+    /// [`OrderType::ReserveOrder`] with `auto_replenish == false` and hidden
+    /// depth behind it.
+    ///
+    /// Called from every path that rests an order on a level — the
+    /// admission path in `add_order_inner` and the snapshot-restore commit —
+    /// so the sweep's strandable-maker scan can be skipped wholesale on
+    /// books that never held one. Monotonic: see
+    /// [`Self::non_auto_reserve_rested`].
+    #[inline]
+    pub(super) fn note_rested_order<E>(&self, order: &OrderType<E>) {
+        if let OrderType::ReserveOrder {
+            hidden_quantity,
+            auto_replenish: false,
+            ..
+        } = order
+            && hidden_quantity.as_u64() > 0
+        {
+            self.non_auto_reserve_rested.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Re-register a restored resting order with the special-order tracker

@@ -91,9 +91,22 @@ pub enum OrderStatus {
         filled_quantity: u64,
     },
 
-    /// Order fully filled and removed from the book.
+    /// Terminal: the order is off the book and nothing rests.
+    ///
+    /// Usually that is because the whole submitted quantity executed. For a
+    /// two-tranche order whose hidden remainder was **discarded** it is not:
+    /// `filled_quantity` is then the executed quantity only and is below the
+    /// submitted total. That happens on both sides of the trade for a
+    /// reserve without automatic replenishment whose visible tranche is
+    /// exhausted — `pricelevel` removes the resting maker and strands its
+    /// hidden tranche, and an aggressive taker's residual is discarded
+    /// rather than rested. See the "Two-tranche takers" section on
+    /// [`OrderBook::add_order`](super::OrderBook::add_order) for the
+    /// accounting rule.
     Filled {
-        /// Total quantity filled.
+        /// Quantity that actually executed. Equal to the submitted total
+        /// except when a two-tranche order's hidden remainder was
+        /// discarded, where discarded quantity is never counted here.
         filled_quantity: u64,
     },
 

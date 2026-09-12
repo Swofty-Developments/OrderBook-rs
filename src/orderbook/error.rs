@@ -195,6 +195,57 @@ pub enum OrderBookError {
         limit: u128,
     },
 
+    /// A two-tranche order (`IcebergOrder` / `ReserveOrder`) was rejected
+    /// because its visible tranche is zero while it carries hidden
+    /// quantity (#230).
+    ///
+    /// Such an order displays nothing on its level: it contributes no
+    /// visible depth, cannot be filled, and `pricelevel` removes it —
+    /// stranding the hidden tranche — the first time a taker reaches it.
+    /// The rule is enforced by `validate_order_shape`, so it covers
+    /// `add_order` and the projected order of every quantity-carrying
+    /// modify (`UpdateQuantity`, `UpdatePriceAndQuantity`, `Replace`),
+    /// which since #221 set the visible tranche. Single-tranche kinds are
+    /// unaffected. Maps to the stable wire code
+    /// `RejectReason::InvalidQuantity`.
+    ZeroVisibleTranche {
+        /// The order that was rejected.
+        order_id: pricelevel::Id,
+        /// Hidden-tranche quantity behind the empty visible one.
+        hidden_quantity: u64,
+    },
+
+    /// A cancel-then-add modify (`UpdatePrice`, `UpdatePriceAndQuantity`,
+    /// `Replace`) was rejected because re-adding the order would exhaust its
+    /// visible tranche and discard its hidden remainder (#230).
+    ///
+    /// Raised only for a `ReserveOrder` with `auto_replenish == false` and a
+    /// non-empty hidden tranche whose projected price crosses into at least
+    /// `visible_quantity` of contra depth. Because such a residual does not
+    /// rest, letting the modify proceed would cancel the original and then
+    /// silently destroy the re-added order. The check runs **before** the
+    /// cancel, so the original keeps resting untouched — the validate-first
+    /// atomic-modify contract of #98 / #168.
+    ///
+    /// `crossable_quantity` is the dry-run estimate produced by the same
+    /// lot-size- and STP-aware feasibility walk fill-or-kill uses, capped at
+    /// the order's total quantity. It is `>= visible_quantity` and
+    /// `< visible_quantity + hidden_quantity` when this variant is
+    /// constructed: a projected **full** fill is not rejected, because it
+    /// discards nothing. Maps to the stable wire code
+    /// `RejectReason::ReserveResidualWouldBeDiscarded`.
+    ReserveResidualWouldBeDiscarded {
+        /// The order the modify would have destroyed.
+        order_id: pricelevel::Id,
+        /// Projected visible tranche, in quantity units.
+        visible_quantity: u64,
+        /// Contra depth the re-add would cross into, in quantity units.
+        crossable_quantity: u64,
+        /// Projected hidden tranche that would be discarded, in quantity
+        /// units.
+        hidden_quantity: u64,
+    },
+
     /// Submitted price exceeds the configured price band against the
     /// reference price.
     ///
@@ -359,6 +410,26 @@ impl fmt::Display for OrderBookError {
                 write!(
                     f,
                     "risk: submitted price {submitted} deviates {deviation_bps} bps from reference {reference} (limit {limit_bps} bps)"
+                )
+            }
+            OrderBookError::ZeroVisibleTranche {
+                order_id,
+                hidden_quantity,
+            } => {
+                write!(
+                    f,
+                    "zero visible tranche: order {order_id} carries {hidden_quantity} hidden units behind an empty visible tranche; a two-tranche order must display a positive visible quantity"
+                )
+            }
+            OrderBookError::ReserveResidualWouldBeDiscarded {
+                order_id,
+                visible_quantity,
+                crossable_quantity,
+                hidden_quantity,
+            } => {
+                write!(
+                    f,
+                    "reserve residual would be discarded: re-adding order {order_id} would cross {crossable_quantity} units, exhausting its visible tranche of {visible_quantity} and discarding {hidden_quantity} hidden units because automatic replenishment is off; cancel and resubmit deliberately instead"
                 )
             }
             #[cfg(feature = "nats")]
@@ -558,6 +629,24 @@ impl Clone for OrderBookError {
                 reference: *reference,
                 deviation_bps: *deviation_bps,
                 limit_bps: *limit_bps,
+            },
+            OrderBookError::ZeroVisibleTranche {
+                order_id,
+                hidden_quantity,
+            } => OrderBookError::ZeroVisibleTranche {
+                order_id: *order_id,
+                hidden_quantity: *hidden_quantity,
+            },
+            OrderBookError::ReserveResidualWouldBeDiscarded {
+                order_id,
+                visible_quantity,
+                crossable_quantity,
+                hidden_quantity,
+            } => OrderBookError::ReserveResidualWouldBeDiscarded {
+                order_id: *order_id,
+                visible_quantity: *visible_quantity,
+                crossable_quantity: *crossable_quantity,
+                hidden_quantity: *hidden_quantity,
             },
             #[cfg(feature = "nats")]
             OrderBookError::NatsPublishError { message } => OrderBookError::NatsPublishError {

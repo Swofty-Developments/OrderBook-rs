@@ -53,6 +53,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// | `MissingUserId`          | 11  |
 /// | `DuplicateOrderId`       | 12  |
 /// | `InsufficientLiquidity`  | 13  |
+/// | `ReserveResidualWouldBeDiscarded` | 14 |
 /// | `Other(code)`            | code|
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -87,6 +88,10 @@ pub enum RejectReason {
     /// The order could not be filled with the available resting depth
     /// (IOC / FOK semantics).
     InsufficientLiquidity = 13,
+    /// A cancel-then-add modify was refused because re-adding the order
+    /// would exhaust a non-auto-replenishing reserve's visible tranche and
+    /// discard its hidden remainder (#230).
+    ReserveResidualWouldBeDiscarded = 14,
     /// Caller-supplied / unmapped code. The library never emits this
     /// variant; it exists so applications can ferry their own reject
     /// codes through the same channel without forking the enum.
@@ -116,6 +121,7 @@ impl RejectReason {
             Self::MissingUserId => 11,
             Self::DuplicateOrderId => 12,
             Self::InsufficientLiquidity => 13,
+            Self::ReserveResidualWouldBeDiscarded => 14,
             Self::Other(code) => code,
         }
     }
@@ -141,6 +147,7 @@ impl RejectReason {
             11 => Self::MissingUserId,
             12 => Self::DuplicateOrderId,
             13 => Self::InsufficientLiquidity,
+            14 => Self::ReserveResidualWouldBeDiscarded,
             other => Self::Other(other),
         }
     }
@@ -189,6 +196,9 @@ impl std::fmt::Display for RejectReason {
             Self::MissingUserId => write!(f, "missing user id"),
             Self::DuplicateOrderId => write!(f, "duplicate order id"),
             Self::InsufficientLiquidity => write!(f, "insufficient liquidity"),
+            Self::ReserveResidualWouldBeDiscarded => {
+                write!(f, "reserve residual would be discarded")
+            }
             Self::Other(code) => write!(f, "other({code})"),
         }
     }
@@ -222,9 +232,13 @@ impl From<&OrderBookError> for RejectReason {
             OrderBookError::InvalidTickSize { .. } => Self::InvalidPrice,
             OrderBookError::InvalidLotSize { .. } => Self::InvalidQuantity,
             OrderBookError::QuantityOverflow { .. } => Self::InvalidQuantity,
+            OrderBookError::ZeroVisibleTranche { .. } => Self::InvalidQuantity,
             OrderBookError::OrderSizeOutOfRange { .. } => Self::OrderSizeOutOfRange,
             OrderBookError::DuplicateOrderId { .. } => Self::DuplicateOrderId,
             OrderBookError::MissingUserId { .. } => Self::MissingUserId,
+            OrderBookError::ReserveResidualWouldBeDiscarded { .. } => {
+                Self::ReserveResidualWouldBeDiscarded
+            }
             OrderBookError::PriceLevelError(_) => Self::Other(0),
             OrderBookError::OrderNotFound(_) => Self::Other(0),
             OrderBookError::InvalidOperation { .. } => Self::Other(0),
@@ -246,7 +260,7 @@ mod tests {
 
     /// Every named variant — used to drive exhaustive table-style tests.
     /// The `Other` variant is added explicitly where needed.
-    fn named_variants() -> [RejectReason; 13] {
+    fn named_variants() -> [RejectReason; 14] {
         [
             RejectReason::KillSwitchActive,
             RejectReason::RiskMaxOpenOrders,
@@ -261,6 +275,7 @@ mod tests {
             RejectReason::MissingUserId,
             RejectReason::DuplicateOrderId,
             RejectReason::InsufficientLiquidity,
+            RejectReason::ReserveResidualWouldBeDiscarded,
         ]
     }
 
@@ -279,6 +294,7 @@ mod tests {
         assert_eq!(RejectReason::MissingUserId.as_u16(), 11);
         assert_eq!(RejectReason::DuplicateOrderId.as_u16(), 12);
         assert_eq!(RejectReason::InsufficientLiquidity.as_u16(), 13);
+        assert_eq!(RejectReason::ReserveResidualWouldBeDiscarded.as_u16(), 14);
     }
 
     #[test]

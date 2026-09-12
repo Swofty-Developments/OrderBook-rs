@@ -402,8 +402,28 @@ where
         // active, so the default (`STPMode::None`) hot path touches the pool
         // exactly as it did before #107 (an empty `Vec::new()` allocates nothing
         // and is never filled or returned).
-        let (mut filled_orders, mut empty_price_levels) =
-            MATCHING_POOL.with(|pool| (pool.get_filled_orders_vec(), pool.get_price_vec()));
+        //
+        // #230: makers that would strand hidden depth if this sweep consumed
+        // them, captured per level BEFORE it is matched (the level drops them
+        // during the match, so the hidden quantity is unrecoverable after).
+        // Same `(Id, quantity)` shape as `filled_orders`, so it reuses the
+        // same pool.
+        //
+        // The gate is read ONCE here, not per level: on a book that has never
+        // rested a non-auto-replenishing reserve with hidden depth the whole
+        // strandable path drops out of this sweep — `None` means no pool
+        // acquire, no per-level capture, no lookup in the drain loop and
+        // nothing to return. That matters because the capture walks the
+        // level's `DashMap` of orders, which read-locks every shard.
+        let watch_strandable = self.non_auto_reserve_rested.load(Ordering::Relaxed);
+        let (mut filled_orders, mut empty_price_levels, mut strandable_makers) = MATCHING_POOL
+            .with(|pool| {
+                (
+                    pool.get_filled_orders_vec(),
+                    pool.get_price_vec(),
+                    watch_strandable.then(|| pool.get_filled_orders_vec()),
+                )
+            });
         let mut stp_orders = if stp_active {
             MATCHING_POOL.with(|pool| pool.get_order_snapshot_vec())
         } else {
@@ -516,6 +536,9 @@ where
                         if safe_quantity > 0 {
                             let match_qty = qty_cap.min(safe_quantity);
                             if match_qty > 0 {
+                                if let Some(strandable) = strandable_makers.as_mut() {
+                                    self.capture_strandable_makers(price_level, strandable);
+                                }
                                 let price_level_match = price_level.match_order(
                                     match_qty,
                                     order_id,
@@ -592,6 +615,9 @@ where
                         if safe_quantity > 0 {
                             let match_qty = qty_cap.min(safe_quantity);
                             if match_qty > 0 {
+                                if let Some(strandable) = strandable_makers.as_mut() {
+                                    self.capture_strandable_makers(price_level, strandable);
+                                }
                                 let price_level_match = price_level.match_order(
                                     match_qty,
                                     order_id,
@@ -643,6 +669,9 @@ where
             }
 
             // --- Normal matching (no STP conflict or after CancelMaker cleanup) ---
+            if let Some(strandable) = strandable_makers.as_mut() {
+                self.capture_strandable_makers(price_level, strandable);
+            }
             let price_level_match = price_level.match_order(
                 qty_cap,
                 order_id,
@@ -699,6 +728,14 @@ where
         // `process_level_match`), so OrderStateTracker / lifecycle consumers and
         // any audit/risk reconciliation that sums filled quantity from terminal
         // events see the real executed amount instead of a `0` placeholder (#104).
+        // `Filled { filled_quantity }` here is the executed quantity, which for
+        // a removed non-auto-replenishing reserve maker is its visible tranche
+        // only: `pricelevel` drops the hidden depth behind it rather than
+        // refreshing (#230). Report that discard exactly as the aggressive
+        // residual guard in `add_order_inner` does, so both sides of the trade
+        // feed the same counter and the same `INFO` trace, distinguished by
+        // `path`. `strandable_makers` is `None` on every sweep of a book that
+        // never rested such a maker, so the lookup is skipped entirely there.
         for (filled_id, filled_quantity) in &filled_orders {
             self.track_state(
                 *filled_id,
@@ -706,6 +743,20 @@ where
                     filled_quantity: *filled_quantity,
                 },
             );
+            if let Some(strandable) = strandable_makers.as_ref()
+                && let Some((_, discarded_hidden)) = strandable
+                    .iter()
+                    .find(|(strandable_id, _)| strandable_id == filled_id)
+            {
+                tracing::info!(
+                    path = "maker",
+                    order_id = %filled_id,
+                    executed_quantity = *filled_quantity,
+                    discarded_hidden_quantity = *discarded_hidden,
+                    "reserve maker removed: visible tranche exhausted without auto-replenishment"
+                );
+                crate::orderbook::metrics::record_reserve_hidden_discarded(*discarded_hidden);
+            }
             self.order_locations.remove(filled_id);
             self.untrack_order_by_id(filled_id);
         }
@@ -715,6 +766,9 @@ where
         // is simply dropped.
         MATCHING_POOL.with(|pool| {
             pool.return_filled_orders_vec(filled_orders);
+            if let Some(strandable) = strandable_makers {
+                pool.return_filled_orders_vec(strandable);
+            }
             pool.return_price_vec(empty_price_levels);
             if stp_active {
                 pool.return_order_snapshot_vec(stp_orders);
@@ -864,6 +918,60 @@ where
                 limit_price: Some(_),
                 ..
             } => Ok(match_result),
+        }
+    }
+
+    /// Record every maker resting at `price_level` whose hidden depth this
+    /// sweep would **strand** if it consumed the maker's visible tranche
+    /// (#230): a [`OrderType::ReserveOrder`] with `auto_replenish == false`
+    /// and hidden quantity behind it. `pricelevel` removes such a maker once
+    /// its visible tranche is fully taken, dropping the hidden depth instead
+    /// of refreshing from it, and the order body is gone by the time the
+    /// match returns — so the amount has to be captured beforehand to be
+    /// reportable at all.
+    ///
+    /// Appends to `out`; the caller drains it after the sweep, matching ids
+    /// against the makers the level actually removed. Every level is matched
+    /// at most once per sweep, so a maker is captured at most once.
+    ///
+    /// Cost:
+    ///
+    /// - On a book that never rested such a maker — the overwhelmingly
+    ///   common case, and the one the `non_auto_reserve_rested` flag
+    ///   detects — this is never called at all: `match_order_inner` reads
+    ///   the flag once per sweep and skips the buffer, the captures and the
+    ///   drain lookup wholesale. On a book that did, a level with no hidden
+    ///   depth costs one relaxed atomic load here and nothing else.
+    /// - On a book that did rest one, every level holding hidden depth
+    ///   (so any two-tranche kind, not just the strandable ones) pays a
+    ///   full pass over the level's resting orders. `iter_orders` is
+    ///   `DashMap::iter` upstream, which read-locks **every shard** of the
+    ///   map regardless of how few orders rest at the level, so this pass
+    ///   is **not** free and shows up in the tails. The flag exists to
+    ///   confine it to the books where it can actually report something.
+    ///   The `reserve_sweep_hdr` benchmark covers both arms; see `BENCH.md`
+    ///   for the current figures.
+    #[inline]
+    fn capture_strandable_makers(
+        &self,
+        price_level: &std::sync::Arc<pricelevel::PriceLevel>,
+        out: &mut Vec<(Id, u64)>,
+    ) {
+        if !self.non_auto_reserve_rested.load(Ordering::Relaxed)
+            || price_level.hidden_quantity() == 0
+        {
+            return;
+        }
+        for order in price_level.iter_orders() {
+            if let OrderType::ReserveOrder {
+                hidden_quantity,
+                auto_replenish: false,
+                ..
+            } = order.as_ref()
+                && hidden_quantity.as_u64() > 0
+            {
+                out.push((order.id(), hidden_quantity.as_u64()));
+            }
         }
     }
 
