@@ -5,7 +5,9 @@
 //! also used by the `Journal` trait for write-ahead
 //! logging and deterministic replay.
 
+use crate::orderbook::error::OrderBookError;
 use crate::orderbook::mass_cancel::MassCancelResult;
+use crate::orderbook::reject_reason::RejectReason;
 use crate::orderbook::trade::TradeResult;
 use pricelevel::{Hash32, Id, OrderType, OrderUpdate, Side, TimestampMs};
 use serde::{Deserialize, Serialize};
@@ -166,10 +168,61 @@ pub enum SequencerResult {
     },
 
     /// The command was rejected by the order book.
+    ///
+    /// Carries only a human-readable reason. When the journal feeds
+    /// [`ReplayEngine`](crate::ReplayEngine), prefer
+    /// [`Self::RejectedWithCode`]: without a machine-readable code replay
+    /// cannot tell a rejection that never touched the book from one that
+    /// traded first, so a `Rejected` submit is always skipped on replay.
     Rejected {
         /// Human-readable reason for the rejection.
         reason: String,
     },
+
+    /// The command was rejected by the order book, recorded with its
+    /// stable wire-side [`RejectReason`] alongside the human-readable
+    /// message.
+    ///
+    /// A submit — `AddOrder`, `MarketOrder`, `MarketOrderByAmount` — can
+    /// execute real trades and *then* fail (an IOC whose remainder is
+    /// unfillable, a taker STP cancels after non-self fills), so a
+    /// rejection alone does not say whether the book moved. The code lets
+    /// [`ReplayEngine`](crate::ReplayEngine) re-execute the rejections it
+    /// can reproduce from the book state and its config, and check the
+    /// re-executed verdict against the recorded one; see the replay
+    /// entry points for the rules. Build it from the typed error with the
+    /// `From<&OrderBookError>` impl on this enum, which fills both fields.
+    ///
+    /// Wire-compatible addition (a variant appended to a `#[non_exhaustive]`
+    /// enum): existing journals decode unchanged and bincode variant
+    /// indices are unaffected. Journals carrying `RejectedWithCode` will
+    /// fail to decode against older binaries — this matches the precedent
+    /// set by [`SequencerCommand::MarketOrderByAmount`]. The code encodes
+    /// as its stable `u16` wire value, as `RejectReason` always does.
+    RejectedWithCode {
+        /// Human-readable reason for the rejection.
+        reason: String,
+        /// The stable reject code, as `RejectReason::from(&OrderBookError)`.
+        code: RejectReason,
+    },
+}
+
+/// Record a rejection with its stable reject code.
+///
+/// Produces [`SequencerResult::RejectedWithCode`] with `reason` set to
+/// the error's `Display` text and `code` to
+/// [`RejectReason::from(&OrderBookError)`](RejectReason#impl-From<%26OrderBookError>-for-RejectReason),
+/// the same mapping `OrderStatus::Rejected` uses — so a sequencer records
+/// the outcome the command API returned in one step and replay can act on
+/// it.
+impl From<&OrderBookError> for SequencerResult {
+    #[inline]
+    fn from(err: &OrderBookError) -> Self {
+        Self::RejectedWithCode {
+            reason: err.to_string(),
+            code: RejectReason::from(err),
+        }
+    }
 }
 
 /// A sequenced event emitted by the Sequencer after processing a command.
