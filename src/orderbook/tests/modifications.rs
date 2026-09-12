@@ -837,7 +837,7 @@ mod tests {
             price: Price::new(100),
             visible_quantity: Quantity::new(visible),
             hidden_quantity: Quantity::new(hidden),
-            replenish_amount: Some(std::num::NonZeroU64::new(10).expect("nonzero")),
+            replenish_amount: std::num::NonZeroU64::new(10),
             auto_replenish: true,
             replenish_threshold: Quantity::new(0),
             user_id: Hash32::zero(),
