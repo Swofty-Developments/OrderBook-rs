@@ -41,9 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   size limits), because the requested size is now actually applied and
   the projected total is larger than the one the original run evaluated.
   Account risk limits are not part of `ReplayBookConfig`, so
-  `RiskMaxNotional` cannot arise on replay. For the same reason
-  `ReplayEngine::verify` returns `Ok(false)` when such a journal is
-  checked against a snapshot captured by the pre-fix run.
+  `RiskMaxNotional` cannot arise on replay. `ReplayEngine::verify` on
+  such a journal may return `Ok(false)` when the replay succeeds and the
+  resulting snapshot differs from the one captured by the pre-fix run,
+  or propagate the replay error when the re-executed update is rejected.
 
 ## [0.12.0] — 2026-07-14
 

@@ -135,10 +135,11 @@ println!("Average price: {}", result.average_price());
   explicit replenishment policy)
 - Reduce market impact
 - The tranches are independent and the order's total is `visible + hidden`.
-  Every quantity on the public API addresses the **visible** tranche: the
-  `visible_quantity` argument of `add_iceberg_order` and the quantity carried
-  by `OrderUpdate::UpdateQuantity`, `OrderUpdate::UpdatePriceAndQuantity` and
-  `OrderUpdate::Replace`
+  The quantity supplied to these modification variants addresses the
+  **visible** tranche and leaves the hidden tranche untouched:
+  `OrderUpdate::UpdateQuantity`, `OrderUpdate::UpdatePriceAndQuantity` and
+  `OrderUpdate::Replace`. `add_iceberg_order` takes the visible and hidden
+  tranches as separate arguments
 
 **Time-In-Force:**
 - `Gtc` (Good-Till-Cancel): Remain until filled or cancelled
@@ -240,8 +241,7 @@ instead. Shape validation (tick size, lot size, `visible + hidden`
 representability) and the risk gate run on the projected order, and the
 min / max order size limits apply to its `visible + hidden` total, so an
 update can be rejected for a size larger than the quantity you passed.
-Rejections are checked before anything is mutated, so a rejected update
-leaves the original order resting unchanged.
+These pre-admission rejections leave the original order unchanged.
 
 ### Cancelling Orders
 
