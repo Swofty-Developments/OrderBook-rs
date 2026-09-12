@@ -77,19 +77,23 @@ pub trait OrderQuantity<T = ()> {
     ///   explicit threshold qualifies too. It adds the explicit
     ///   `replenish_amount`, or `pricelevel`'s
     ///   [`DEFAULT_RESERVE_REPLENISH_AMOUNT`] when there is none, capped by
-    ///   the hidden tranche. With `auto_replenish` off the
-    ///   visible tranche stays empty and nothing is drawn from hidden:
-    ///   `add_order_inner` then ends the order instead of resting it,
-    ///   exactly as `pricelevel` removes a depleted non-auto maker from
-    ///   its level.
+    ///   the hidden tranche.
     ///
-    ///   Because the default is capped by hidden rather than by the
-    ///   originally submitted display size, a residual can rest showing
-    ///   **more** than the order first displayed: a 10 visible / 20 hidden
-    ///   reserve with no explicit amount, filled for 10, refreshes with
+    ///   With `auto_replenish` off nothing is drawn from hidden. That only
+    ///   ends the order when the fill **exhausted** the visible tranche: the
+    ///   tranche is left empty and `add_order_inner` discards the residual,
+    ///   exactly as `pricelevel` removes a depleted non-auto maker from its
+    ///   level. A fill that leaves any visible quantity rests normally — a
+    ///   10 visible / 20 hidden reserve filled for 5 rests 5 / 20.
+    ///
+    ///   The explicit `replenish_amount` is the **transfer**, not a target
+    ///   display size: it is added to whatever visible quantity survived.
+    ///   With amount 10, threshold 5 and a remainder of 2 visible, the
+    ///   residual rests 12 visible. Without an explicit amount the transfer
+    ///   is [`DEFAULT_RESERVE_REPLENISH_AMOUNT`] capped by hidden, so a
+    ///   10 / 20 reserve filled for 10 refreshes with
     ///   `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, 20) == 20` and rests 20
-    ///   visible / 0 hidden. Set an explicit `replenish_amount` to pin the
-    ///   displayed size.
+    ///   visible / 0 hidden — more than it first displayed.
     ///
     ///   This total-target policy belongs to
     ///   this method only; since #221 [`Self::set_quantity`] sets the
@@ -344,6 +348,12 @@ fn reserve_residual_would_be_discarded(
         visible_quantity,
         crossable_quantity,
         hidden_quantity,
+        // The residual the re-add would leave unmatched and then abandon.
+        // Cannot underflow: the caller only builds this error inside the
+        // band `crossable < visible + hidden`.
+        discarded_quantity: visible_quantity
+            .saturating_add(hidden_quantity)
+            .saturating_sub(crossable_quantity),
     }
 }
 
@@ -426,10 +436,25 @@ where
     ///   with a positive visible tranche), and so is a projected full fill
     ///   (it discards nothing).
     ///
-    /// Both are best-effort dry runs over the opposite book side, evaluated
-    /// under whatever gate mode the modify holds: exact under the exclusive
-    /// side, raceable against a concurrent opposite-side mutation under the
-    /// shared side.
+    /// # What the gate covers
+    ///
+    /// The gate mode is chosen **before** anything is read, from
+    /// [`strandable_makers_resting`](Self::strandable_makers_resting) and
+    /// the STP mode — never from a lookup of the order being modified,
+    /// which could go stale between the lookup and the acquisition. The
+    /// guard is then held across the *whole* operation: the order lookup,
+    /// the shared shape validator, both pre-checks, the cancel and the
+    /// re-add. Nothing is decided from state read outside it.
+    ///
+    /// On a book holding strandable makers, or with STP engaged, that mode
+    /// is exclusive, so for the case the second pre-check exists to protect
+    /// — re-pricing a non-replenishing reserve that carries hidden quantity
+    /// — the crossable-depth dry run is **exact**: no concurrent mutation
+    /// can move the opposite side between the estimate and the re-add's
+    /// sweep, so such a re-price cannot destroy the order it modifies.
+    /// On a book holding none, a re-price of some *other* order runs
+    /// shared, where the #168 self-cross dry run keeps its existing
+    /// best-effort character.
     pub fn update_order(
         &self,
         update: OrderUpdate,
@@ -441,7 +466,7 @@ where
         // re-add and no concurrent admission, cancel or modify can land
         // between the re-add's STP scan and its fill. Repricing inherits
         // this path, so pegged / trailing-stop re-prices are covered too.
-        let _gate = self.acquire_submit_gate(self.modify_needs_exclusive_gate(&update));
+        let _gate = self.acquire_coherent_submit_gate(self.modify_needs_exclusive_gate(&update));
         // Gate non-cancel variants on the kill switch. Cancel passes
         // through unchanged so operators can drain the book. The
         // existing order stays live — only the modification is
@@ -1047,6 +1072,11 @@ where
                 // Remove the order from the user_orders index
                 self.untrack_user_order(cancelled_order.user_id(), &order_id);
 
+                // #230: this helper is the funnel for user cancels, the
+                // cancel-then-add modifies, mass cancel and expiry eviction,
+                // so one decrement here covers all of them.
+                self.note_removed_order(cancelled_order.as_ref());
+
                 // Unregister special orders from re-pricing tracking
                 #[cfg(feature = "special_orders")]
                 {
@@ -1128,6 +1158,9 @@ where
         self.order_locations.remove(&order_id);
         self.risk_state.on_cancel(order_id);
         self.untrack_user_order(cancelled.user_id(), &order_id);
+        // #230: the self-trade-prevention maker cancel is the one removal
+        // that does not go through `cancel_order_with_reason`.
+        self.note_removed_order(cancelled.as_ref());
 
         #[cfg(feature = "special_orders")]
         {
@@ -1154,8 +1187,8 @@ where
     ///
     /// Checks, in order:
     /// 1. Two-tranche total representability (`QuantityOverflow`).
-    /// 2. Two-tranche visible tranche non-empty (`ZeroVisibleTranche` —
-    ///    see below).
+    /// 2. Non-auto reserve's visible tranche non-empty
+    ///    (`ZeroVisibleTranche` — see below).
     /// 3. STP `MissingUserId` (when STP is enabled and `user_id` is zero).
     /// 4. Tick size (`InvalidTickSize`).
     /// 5. Lot size (`InvalidLotSize`, per order kind — see below).
@@ -1166,18 +1199,35 @@ where
     ///
     /// # Zero visible tranche
     ///
-    /// An `IcebergOrder` or `ReserveOrder` whose `visible_quantity` is zero
-    /// while `hidden_quantity > 0` is rejected with
-    /// [`OrderBookError::ZeroVisibleTranche`] (#230). Such an order displays
-    /// nothing on its level, so it adds no visible depth, cannot be filled,
-    /// and `pricelevel` removes it — stranding the hidden tranche — the
-    /// first time a taker reaches it. Because the rule lives here it covers
+    /// A `ReserveOrder` with `auto_replenish == false` whose
+    /// `visible_quantity` is zero while `hidden_quantity > 0` is rejected
+    /// with [`OrderBookError::ZeroVisibleTranche`] (#230). It displays
+    /// nothing on its level, adds no visible depth, and `pricelevel`'s
+    /// `match_against` returns `(0, None, 0, remaining)` for it: the maker is
+    /// removed without a trade and its whole hidden tranche is stranded, the
+    /// first time a taker reaches it.
+    ///
+    /// The rule is deliberately **that shape only**. The other zero-visible
+    /// two-tranche shapes execute rather than vanishing, so they stay
+    /// admissible: an `IcebergOrder` draws its entire hidden tranche into
+    /// visible on match (upstream's "degenerate guard", which exists to keep
+    /// the sweep making progress), and an auto-replenishing `ReserveOrder`
+    /// refreshes `min(replenish_amount_or_default, hidden)` and re-queues.
+    ///
+    /// Because the rule lives here it covers
     /// `add_order` and the projected order of every quantity-carrying modify
     /// (`UpdateQuantity`, `UpdatePriceAndQuantity`, `Replace`), which since
     /// #221 set the **visible** tranche and could otherwise drive a resting
-    /// two-tranche order into that shape. Single-tranche kinds are
-    /// unaffected, and so is a `(0, 0)` two-tranche order, which carries
+    /// reserve into that shape. Single-tranche kinds are
+    /// unaffected, and so is a `(0, 0)` reserve, which carries
     /// nothing to strand.
+    ///
+    /// Interaction with #223: that issue gives
+    /// `UpdateQuantity { new_quantity: 0 }` a zero-is-cancel meaning. This
+    /// rejection applies to the narrowed shape on that variant only until
+    /// #223 lands, at which point a zero quantity cancels the order instead
+    /// of projecting a ghost and the rejection becomes unreachable through
+    /// `UpdateQuantity`. The other two variants are unaffected either way.
     ///
     /// # Lot size
     ///
@@ -1262,27 +1312,21 @@ where
             });
         }
 
-        // Zero visible tranche (#230): a two-tranche order that displays
-        // nothing is a ghost — no visible depth, unfillable, and removed by
-        // `pricelevel` with its hidden tranche stranded the first time a
-        // taker reaches it. Rejected here so `add_order` and every
-        // quantity-carrying modify projection are covered by one rule.
-        if let OrderType::IcebergOrder {
-            visible_quantity,
-            hidden_quantity,
-            ..
-        }
-        | OrderType::ReserveOrder {
-            visible_quantity,
-            hidden_quantity,
-            ..
-        } = order
-            && visible_quantity.as_u64() == 0
-            && hidden_quantity.as_u64() > 0
-        {
+        // Zero visible tranche (#230): a NON-AUTO-REPLENISHING reserve that
+        // displays nothing is a ghost — no visible depth, and `pricelevel`
+        // removes it with its hidden tranche stranded, without a trade, the
+        // first time a taker reaches it. Rejected here so `add_order` and
+        // every quantity-carrying modify projection are covered by one rule.
+        //
+        // Deliberately NOT extended to the other two-tranche shapes: an
+        // iceberg draws its whole hidden tranche into visible on match
+        // (upstream's "degenerate guard"), and an auto-replenishing reserve
+        // refreshes `min(amount_or_default, hidden)` and re-queues, so both
+        // execute rather than vanishing and neither is a ghost.
+        if let Some(hidden_quantity) = Self::is_zero_visible_ghost(order) {
             return Err(OrderBookError::ZeroVisibleTranche {
                 order_id: order.id(),
-                hidden_quantity: hidden_quantity.as_u64(),
+                hidden_quantity,
             });
         }
 
@@ -1547,8 +1591,10 @@ where
     ///   least its visible tranche — the exact condition under which the
     ///   residual guard fires — **and** strictly less than its total. A
     ///   projected **full** fill is allowed through: it executes everything
-    ///   and discards nothing, and so is a non-crossing re-price, which
-    ///   rewrites no tranches at all.
+    ///   and discards nothing.
+    ///
+    /// A non-crossing re-price, `crossable == 0`, rewrites no tranche and is
+    /// allowed as well.
     ///
     /// A projected visible tranche of zero cannot reach here: the shared
     /// validator rejects that shape with
@@ -1562,16 +1608,23 @@ where
     /// evaluating it while the same-side original still rests yields the
     /// same verdict as after cancel.
     ///
-    /// Best-effort, as with #168: the dry run is exact under the exclusive
-    /// gate, but a modify holding the shared side can race a concurrent
-    /// mutation of the opposite side between the estimate and the sweep.
+    /// The dry run is **exact**, not best-effort. Whenever this check can
+    /// fire, the order being modified is itself a strandable maker, so the
+    /// book's `strandable_makers_resting` is at least one and
+    /// [`modify_needs_exclusive_gate`](Self::modify_needs_exclusive_gate)
+    /// has already put the whole modify on the exclusive side: no
+    /// concurrent mutation can move the opposite side between this estimate
+    /// and the re-add's sweep. (The #168 self-cross check keeps its
+    /// best-effort character, because it also runs on books that hold no
+    /// strandable maker and therefore modify on the shared side.)
     /// Auto-replenishing reserves, icebergs, single-tranche kinds and
     /// non-crossing re-prices never reach the walk.
     ///
     /// # Errors
     /// [`OrderBookError::ReserveResidualWouldBeDiscarded`] carrying the
-    /// order id, the projected visible and hidden tranches, and the
-    /// crossable quantity.
+    /// order id, the projected visible tranche, the crossable quantity, the
+    /// projected `hidden_quantity` and the `discarded_quantity` that would
+    /// actually be destroyed (`visible + hidden - crossable`).
     pub(super) fn check_modify_reserve_residual(
         &self,
         new_order: &OrderType<T>,
@@ -1726,13 +1779,18 @@ where
     /// submitted = executed + resting (visible + hidden) + discarded
     /// ```
     ///
-    /// Because the default refresh is capped by hidden rather than by the
-    /// size the order first displayed, a residual can rest showing more than
-    /// it originally showed: the 10 visible / 20 hidden reserve above, with
-    /// no explicit amount and automatic replenishment on, executes 10 and
-    /// rests 20 visible / 0 hidden, since
-    /// `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, 20) == 20`. Set an explicit
-    /// `replenish_amount` to pin the displayed size.
+    /// With `auto_replenish` off the residual is discarded **only when the
+    /// fill exhausted the visible tranche**. A shallower fill rests
+    /// normally: the 10 visible / 20 hidden reserve above, filled for 5,
+    /// rests 5 / 20 with nothing discarded.
+    ///
+    /// An explicit `replenish_amount` is the transfer, not a target display
+    /// size: it is added to whatever visible quantity survived, so amount
+    /// 10 with threshold 5 and a remainder of 2 visible rests 12 visible.
+    /// Without one the transfer is `DEFAULT_RESERVE_REPLENISH_AMOUNT` capped
+    /// by hidden, so the same reserve filled for 10 rests 20 visible / 0
+    /// hidden — more than it first displayed, since
+    /// `min(DEFAULT_RESERVE_REPLENISH_AMOUNT, 20) == 20`.
     ///
     /// ## What the returned order holds
     ///
@@ -1771,10 +1829,13 @@ where
         // #225: also exclusive for an STP-relevant submit, so the per-level
         // STP scan and the fill it authorises see the same queue state. A
         // post-only submit never reaches that scan, so it stays shared.
-        let _gate = self.acquire_submit_gate(self.submit_needs_exclusive_gate(
+        let _gate = self.acquire_coherent_submit_gate(self.submit_needs_exclusive_gate(
             order.is_fill_or_kill(),
             order.user_id(),
             order.is_post_only(),
+            // #230: admitting a strandable maker is exclusive in every
+            // STPMode, so no sweep can consume one it never captured.
+            Self::is_strandable_maker(&order),
         ));
         self.add_order_inner(order, false).map(|(order, _)| order)
     }
@@ -1822,10 +1883,13 @@ where
         order: OrderType<T>,
     ) -> Result<(Arc<OrderType<T>>, Option<TradeResult>), OrderBookError> {
         // #209 / #225: same gating as `add_order`.
-        let _gate = self.acquire_submit_gate(self.submit_needs_exclusive_gate(
+        let _gate = self.acquire_coherent_submit_gate(self.submit_needs_exclusive_gate(
             order.is_fill_or_kill(),
             order.user_id(),
             order.is_post_only(),
+            // #230: admitting a strandable maker is exclusive in every
+            // STPMode, so no sweep can consume one it never captured.
+            Self::is_strandable_maker(&order),
         ));
         self.add_order_inner(order, true)
     }

@@ -46,6 +46,28 @@ fn order_matchable_qty(order: &OrderType<()>) -> u64 {
     visible.saturating_add(drawable_hidden)
 }
 
+/// Hidden quantity `filled_id` would strand, looked up in the sweep's
+/// captured strandable makers (#230).
+///
+/// `strandable` is sorted by [`Id::as_bytes`] — `Id` does not implement
+/// `Ord` upstream, so that stable 16-byte projection is the sort key. Two
+/// *different* ids can share one projection (`Sequential` zero-pads into the
+/// same 16 bytes a `Uuid` could occupy), so the equal-key run is walked and
+/// the ids compared for real equality rather than trusting the key alone.
+/// That run is length 1 in every realistic book.
+#[must_use]
+#[inline]
+fn find_strandable(strandable: &[(Id, u64)], filled_id: Id) -> Option<u64> {
+    let key = filled_id.as_bytes();
+    let start = strandable.partition_point(|(id, _)| id.as_bytes() < key);
+    strandable
+        .get(start..)?
+        .iter()
+        .take_while(|(id, _)| id.as_bytes() == key)
+        .find(|(id, _)| *id == filled_id)
+        .map(|(_, hidden)| *hidden)
+}
+
 /// Outcome of an internal match: the [`MatchResult`] plus whether self-trade
 /// prevention cancelled the taker. The flag lets the resting caller (`add_order`)
 /// know it must NOT rest the residual — a partially-filled taker that then
@@ -231,7 +253,15 @@ where
     ) -> Result<MatchResult, OrderBookError> {
         // #209: shared submit gate; calls the ungated outcome variant so
         // the non-reentrant gate is acquired exactly once.
-        let _gate = self.submit_gate_read();
+        //
+        // #230: through the coherent helper, so this sweep upgrades to the
+        // exclusive side in a book that holds strandable makers. An
+        // anonymous taker never runs the STP scan, so the strandable rule is
+        // the only one that can apply here — but it must apply: on the
+        // shared side a concurrent cancel could remove a maker this sweep
+        // has already captured and free its id for an unrelated order, and
+        // the drain would then report a discard that never happened.
+        let _gate = self.acquire_coherent_submit_gate(false);
         self.match_order_with_user_outcome(
             order_id,
             side,
@@ -272,8 +302,12 @@ where
         // authorises see the same queue state. Match-only entry points
         // always sweep as `TakerKind::Standard`, hence `is_post_only =
         // false`.
-        let _gate =
-            self.acquire_submit_gate(self.submit_needs_exclusive_gate(false, taker_user_id, false));
+        let _gate = self.acquire_coherent_submit_gate(self.submit_needs_exclusive_gate(
+            false,
+            taker_user_id,
+            false,
+            false,
+        ));
         self.match_order_with_user_outcome(
             order_id,
             side,
@@ -415,7 +449,7 @@ where
         // acquire, no per-level capture, no lookup in the drain loop and
         // nothing to return. That matters because the capture walks the
         // level's `DashMap` of orders, which read-locks every shard.
-        let watch_strandable = self.non_auto_reserve_rested.load(Ordering::Relaxed);
+        let watch_strandable = self.strandable_makers_resting.load(Ordering::Relaxed) > 0;
         let (mut filled_orders, mut empty_price_levels, mut strandable_makers) = MATCHING_POOL
             .with(|pool| {
                 (
@@ -672,6 +706,15 @@ where
             if let Some(strandable) = strandable_makers.as_mut() {
                 self.capture_strandable_makers(price_level, strandable);
             }
+            // #230: park here in tests — after this level's capture and
+            // before its match — so a competitor can be driven against both
+            // windows: admitting a strandable maker into a level the sweep
+            // has not reached, and cancelling one the sweep has already
+            // captured (then reusing its id).
+            #[cfg(test)]
+            if let Some(hook) = self.level_interleave_hook.as_ref() {
+                hook(price);
+            }
             let price_level_match = price_level.match_order(
                 qty_cap,
                 order_id,
@@ -736,6 +779,13 @@ where
         // feed the same counter and the same `INFO` trace, distinguished by
         // `path`. `strandable_makers` is `None` on every sweep of a book that
         // never rested such a maker, so the lookup is skipped entirely there.
+        // Sorted once so the per-maker lookup below is a binary search:
+        // O((S + F) log S) for S captured and F filled, instead of the
+        // O(S * F) linear scan. The report order is the `filled_orders`
+        // order, which this does not touch.
+        if let Some(strandable) = strandable_makers.as_mut() {
+            strandable.sort_unstable_by_key(|(id, _)| id.as_bytes());
+        }
         for (filled_id, filled_quantity) in &filled_orders {
             self.track_state(
                 *filled_id,
@@ -744,18 +794,22 @@ where
                 },
             );
             if let Some(strandable) = strandable_makers.as_ref()
-                && let Some((_, discarded_hidden)) = strandable
-                    .iter()
-                    .find(|(strandable_id, _)| strandable_id == filled_id)
+                && let Some(discarded_hidden) = find_strandable(strandable, *filled_id)
             {
                 tracing::info!(
                     path = "maker",
                     order_id = %filled_id,
                     executed_quantity = *filled_quantity,
-                    discarded_hidden_quantity = *discarded_hidden,
+                    discarded_hidden_quantity = discarded_hidden,
                     "reserve maker removed: visible tranche exhausted without auto-replenishment"
                 );
-                crate::orderbook::metrics::record_reserve_hidden_discarded(*discarded_hidden);
+                crate::orderbook::metrics::record_reserve_hidden_discarded(discarded_hidden);
+                // #230: the fill drain is the third and last place a
+                // strandable maker leaves a level. Being in the capture list
+                // AND in `filled_orders` is exactly that — and, because a
+                // sweep in such a book runs exclusively, the two really are
+                // the same order rather than an id reused in between.
+                self.note_removed_strandable_maker();
             }
             self.order_locations.remove(filled_id);
             self.untrack_order_by_id(filled_id);
@@ -936,12 +990,12 @@ where
     ///
     /// Cost:
     ///
-    /// - On a book that never rested such a maker — the overwhelmingly
-    ///   common case, and the one the `non_auto_reserve_rested` flag
-    ///   detects — this is never called at all: `match_order_inner` reads
-    ///   the flag once per sweep and skips the buffer, the captures and the
-    ///   drain lookup wholesale. On a book that did, a level with no hidden
-    ///   depth costs one relaxed atomic load here and nothing else.
+    /// - On a book with no strandable maker resting — the overwhelmingly
+    ///   common case, and the one `strandable_makers_resting` detects — this
+    ///   is never called at all: `match_order_inner` reads the count once
+    ///   per sweep and skips the buffer, the captures and the drain lookup
+    ///   wholesale. While one does rest, a level with no hidden depth costs
+    ///   one relaxed atomic load here and nothing else.
     /// - On a book that did rest one, every level holding hidden depth
     ///   (so any two-tranche kind, not just the strandable ones) pays a
     ///   full pass over the level's resting orders. `iter_orders` is
@@ -957,7 +1011,7 @@ where
         price_level: &std::sync::Arc<pricelevel::PriceLevel>,
         out: &mut Vec<(Id, u64)>,
     ) {
-        if !self.non_auto_reserve_rested.load(Ordering::Relaxed)
+        if self.strandable_makers_resting.load(Ordering::Relaxed) == 0
             || price_level.hidden_quantity() == 0
         {
             return;

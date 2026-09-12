@@ -195,19 +195,26 @@ pub enum OrderBookError {
         limit: u128,
     },
 
-    /// A two-tranche order (`IcebergOrder` / `ReserveOrder`) was rejected
-    /// because its visible tranche is zero while it carries hidden
-    /// quantity (#230).
+    /// A `ReserveOrder` with `auto_replenish == false` was rejected because
+    /// its visible tranche is zero while it carries hidden quantity (#230).
     ///
-    /// Such an order displays nothing on its level: it contributes no
-    /// visible depth, cannot be filled, and `pricelevel` removes it —
-    /// stranding the hidden tranche — the first time a taker reaches it.
+    /// That shape is the one two-tranche order `pricelevel` cannot execute.
+    /// Its `match_against` returns `(0, None, 0, remaining)` for it: no
+    /// trade, and the maker is removed from the level with its whole hidden
+    /// tranche stranded, the first time a taker reaches it. The other
+    /// zero-visible two-tranche shapes are fine and stay admissible — an
+    /// `IcebergOrder` draws its entire hidden tranche into visible on match
+    /// (the upstream "degenerate guard"), and an auto-replenishing
+    /// `ReserveOrder` refreshes `min(amount_or_default, hidden)` and
+    /// re-queues — so both execute rather than vanishing.
+    ///
     /// The rule is enforced by `validate_order_shape`, so it covers
     /// `add_order` and the projected order of every quantity-carrying
     /// modify (`UpdateQuantity`, `UpdatePriceAndQuantity`, `Replace`),
-    /// which since #221 set the visible tranche. Single-tranche kinds are
-    /// unaffected. Maps to the stable wire code
-    /// `RejectReason::InvalidQuantity`.
+    /// which since #221 set the visible tranche; and by the prepare phase of
+    /// every snapshot restore, which rejects a package carrying the shape
+    /// before touching book state. Single-tranche kinds are unaffected.
+    /// Maps to the stable wire code `RejectReason::InvalidQuantity`.
     ZeroVisibleTranche {
         /// The order that was rejected.
         order_id: pricelevel::Id,
@@ -241,9 +248,16 @@ pub enum OrderBookError {
         visible_quantity: u64,
         /// Contra depth the re-add would cross into, in quantity units.
         crossable_quantity: u64,
-        /// Projected hidden tranche that would be discarded, in quantity
-        /// units.
+        /// Projected hidden tranche of the order, in quantity units. The
+        /// tranche as it would be re-added, **not** the amount that would be
+        /// lost: the sweep draws from it before the residual is abandoned.
         hidden_quantity: u64,
+        /// Quantity that would actually be destroyed, in quantity units:
+        /// `visible_quantity + hidden_quantity - crossable_quantity`, the
+        /// residual the re-add would leave unmatched and then discard.
+        /// Always `> 0` and `<= hidden_quantity` when this variant is
+        /// constructed.
+        discarded_quantity: u64,
     },
 
     /// Submitted price exceeds the configured price band against the
@@ -426,10 +440,11 @@ impl fmt::Display for OrderBookError {
                 visible_quantity,
                 crossable_quantity,
                 hidden_quantity,
+                discarded_quantity,
             } => {
                 write!(
                     f,
-                    "reserve residual would be discarded: re-adding order {order_id} would cross {crossable_quantity} units, exhausting its visible tranche of {visible_quantity} and discarding {hidden_quantity} hidden units because automatic replenishment is off; cancel and resubmit deliberately instead"
+                    "reserve residual would be discarded: re-adding order {order_id} would cross {crossable_quantity} units, exhausting its visible tranche of {visible_quantity} and discarding {discarded_quantity} of its {hidden_quantity} hidden units because automatic replenishment is off; cancel and resubmit deliberately instead"
                 )
             }
             #[cfg(feature = "nats")]
@@ -642,11 +657,13 @@ impl Clone for OrderBookError {
                 visible_quantity,
                 crossable_quantity,
                 hidden_quantity,
+                discarded_quantity,
             } => OrderBookError::ReserveResidualWouldBeDiscarded {
                 order_id: *order_id,
                 visible_quantity: *visible_quantity,
                 crossable_quantity: *crossable_quantity,
                 hidden_quantity: *hidden_quantity,
+                discarded_quantity: *discarded_quantity,
             },
             #[cfg(feature = "nats")]
             OrderBookError::NatsPublishError { message } => OrderBookError::NatsPublishError {

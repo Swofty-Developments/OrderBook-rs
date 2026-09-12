@@ -44,6 +44,21 @@ use serde::{Deserialize, Serialize};
 /// reached and never take liquidity, so they keep the shared side — along
 /// with `UpdateQuantity`, cancels and mass cancels.
 ///
+/// One exclusive case is **not** about STP and applies in every
+/// [`STPMode`], including [`None`](Self::None): while a book **holds** a
+/// `ReserveOrder { auto_replenish: false, .. }` carrying hidden quantity,
+/// every sweep on it runs exclusively (#230) — every matching-capable
+/// submit, every cancel-then-add re-price and every match-only entry point,
+/// plus the admission of the first such reserve. A sweep decides once
+/// whether to capture makers whose hidden depth it would strand, so nothing
+/// may cancel, admit or replace an order inside its capture window: the
+/// sweep could otherwise consume a maker it never captured, or report a
+/// captured maker's hidden quantity after a cancel freed its id for an
+/// unrelated order. Cancels and mass cancels keep the shared side and never
+/// read the count; they are excluded by the sweep's hold, not by their own.
+/// Such books serialize their sweeps; books holding no such reserve are
+/// unchanged.
+///
 /// Anonymous takers (`user_id == Hash32::zero()`) also stay on the shared
 /// path, because STP is skipped for them — but on an STP-enabled book that
 /// is reachable **only** through the match-only entry points
