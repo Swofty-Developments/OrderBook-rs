@@ -562,6 +562,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resulting snapshot differs from the one captured by the pre-fix run,
   or propagate the replay error when the re-executed update is rejected.
 
+- **Replay re-executes journaled submits that traded before returning an
+  error (#224).** `add_order` emits real fills and *then* returns `Err`
+  for an IOC's unfillable remainder and for a taker STP cancels after
+  non-self fills. A sequencer records those as rejections, and
+  `ReplayEngine` skipped every rejected event, so replay silently rebuilt
+  liquidity the live book had consumed: journal a resting ask of 10 and
+  an IOC buy of 15, and the replayed book still carried the ask. Replay
+  now decides by the *recorded reject code* rather than by the
+  success/failure classification. A submit (`AddOrder`, `MarketOrder`,
+  `MarketOrderByAmount`) journaled as the new
+  `SequencerResult::RejectedWithCode` is re-executed when its code is one
+  replay can reproduce from the book state and `ReplayBookConfig` — the
+  two post-fill codes (`InsufficientLiquidity`, `SelfTradePrevention`)
+  and the pure admission rejections (tick, lot, size band, duplicate id,
+  missing user, post-only crossing), which re-derive the same no-op and
+  double as a check that the config matches the source book — and the
+  re-execution must fail under the same `RejectReason`, or replay aborts
+  with the new `ReplayError::OutcomeMismatch` (sequence, recorded code,
+  and what replay produced instead: a success or a different error). A
+  code whose trigger lives outside the config — the kill switch, the risk
+  limits, `Other` — is skipped: those rejections never touch the book, so
+  the skip reproduces the live outcome exactly, where re-executing a
+  kill-switch rejection would rest an order the live book refused or
+  consume liquidity it never touched. A rejected non-submit is skipped as
+  before (the modify paths validate first, cancels are no-ops on a
+  missing order), and a journaled success whose re-execution fails still
+  aborts with `ReplayError::OrderBookError`. `last_applied_seq`, the
+  applied-event count and the progress callback now follow what replay
+  dispatched to the book, so a re-executed rejection that traded advances
+  them. **Stated limitations:** a submit journaled as the string-only
+  `Rejected` keeps the historical skip and therefore the pre-existing gap
+  (replay cannot tell a pure rejection from one that traded first without
+  a code; producers close it by recording `RejectedWithCode`); only the
+  code is compared, not the error's details; and `MarketOrder` /
+  `MarketOrderByAmount` carry no user id, so a market order journaled
+  after STP effects under a user re-executes through the STP-less path
+  and a rejection recorded for it aborts with `OutcomeMismatch` rather
+  than diverging silently. Pinned end-to-end from a live book: the IOC
+  remainder and the STP-cancelled taker replay their fills and advance
+  the applied sequence; a kill-switch rejection is skipped with matching
+  books; a tick rejection re-derives the same no-op; the string-only
+  rejection keeps the skip; a rejected submit that succeeds on replay, or
+  fails under a different code, aborts with `OutcomeMismatch`; a success
+  journaled for a failed submit aborts with `OrderBookError`.
+
+### Added
+
+- **`SequencerResult::RejectedWithCode { reason, code }`** — a rejection
+  carrying its stable wire-side `RejectReason` next to the message, and
+  `impl From<&OrderBookError> for SequencerResult` to build it from the
+  typed error in one step. Appended variant on the `#[non_exhaustive]`
+  enum: existing journals decode unchanged; journals carrying it fail to
+  decode against older binaries, matching the `MarketOrderByAmount`
+  precedent. The code encodes as its `u16` wire value.
+- **`ReplayError::OutcomeMismatch { sequence_num, recorded, actual }`** —
+  raised when a re-executed rejected submit succeeds or fails under a
+  different code than the journal recorded. Additive on an exhaustive
+  enum: downstream exhaustive `match` expressions over `ReplayError` need
+  a new arm.
+
 ## [0.12.0] — 2026-07-14
 
 ### Changed (breaking, semver-minor under 0.x)
