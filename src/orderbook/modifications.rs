@@ -38,14 +38,21 @@ pub trait OrderQuantity<T = ()> {
 
     /// Sets the new quantity for an order, handling the logic for different types.
     ///
-    /// This is the **user-facing quantity update** semantic: for iceberg
-    /// orders the value is applied to the visible tranche (matching
-    /// [`Self::quantity`], which returns the visible quantity), leaving
-    /// the hidden tranche unchanged. For adjusting an aggressive taker's
-    /// **total** remainder before resting, use
-    /// [`Self::set_total_remaining`] instead — applying a total to the
+    /// This is the **user-facing quantity update** semantic: for the
+    /// two-tranche kinds (iceberg and reserve) `new_quantity` applies to
+    /// the **visible** tranche, matching [`Self::quantity`] (which returns
+    /// the visible quantity) and the upstream
+    /// [`OrderUpdate::UpdateQuantity`] / [`OrderType::with_reduced_quantity`]
+    /// contract. The hidden tranche is left untouched, so the new total is
+    /// `new_quantity + hidden` and an increase is honoured. Before #221 a
+    /// reserve order read the argument as a **total** target and only ever
+    /// reduced: a requested increase was silently dropped and a decrease
+    /// was drawn across both tranches.
+    ///
+    /// To adjust an aggressive taker's **total** remainder before resting,
+    /// use [`Self::set_total_remaining`] instead; applying a total to the
     /// visible tranche manufactures liquidity (#210).
-    fn set_quantity(&mut self, new_total_quantity: u64);
+    fn set_quantity(&mut self, new_quantity: u64);
 
     /// Distributes a **total** remaining quantity across the order's
     /// tranches before resting an aggressive taker's residual (#210).
@@ -57,9 +64,12 @@ pub trait OrderQuantity<T = ()> {
     ///   visible tranche shrinks only the display; a fill past it
     ///   consumes hidden; conservation always holds:
     ///   `visible + hidden == remaining_total`.
-    /// - Reserve: reduction is drawn from the visible tranche first, then
-    ///   hidden, with the existing replenish-on-empty behaviour (same
-    ///   policy `set_quantity` already implemented for Reserve).
+    /// - Reserve: the reduction is drawn from the visible tranche first
+    ///   and then from hidden, replenishing the visible tranche when it
+    ///   empties while hidden remains. This total-target policy belongs to
+    ///   this method only; since #221 [`Self::set_quantity`] sets the
+    ///   reserve's visible tranche like every other user-facing quantity
+    ///   update.
     fn set_total_remaining(&mut self, remaining_total: u64);
 }
 
@@ -126,25 +136,27 @@ impl<T> OrderQuantity<T> for OrderType<T> {
     }
 
     #[inline]
-    fn set_quantity(&mut self, new_total_quantity: u64) {
+    fn set_quantity(&mut self, new_quantity: u64) {
         match self {
             OrderType::Standard { quantity, .. }
             | OrderType::PostOnly { quantity, .. }
             | OrderType::TrailingStop { quantity, .. }
             | OrderType::PeggedOrder { quantity, .. }
-            | OrderType::MarketToLimit { quantity, .. } => {
-                *quantity = Quantity::new(new_total_quantity)
-            }
+            | OrderType::MarketToLimit { quantity, .. } => *quantity = Quantity::new(new_quantity),
 
             OrderType::IcebergOrder {
                 visible_quantity, ..
-            } => {
-                // For iceberg orders, treat new_total_quantity as the new visible quantity
-                // This matches the expected behavior where quantity() returns visible_quantity
-                *visible_quantity = Quantity::new(new_total_quantity);
-                // Hidden quantity remains unchanged
             }
-            OrderType::ReserveOrder { .. } => reduce_reserve_to_total(self, new_total_quantity),
+            | OrderType::ReserveOrder {
+                visible_quantity, ..
+            } => {
+                // Two-tranche kinds take `new_quantity` as the new visible
+                // tranche, matching what `quantity()` reports and the
+                // upstream `UpdateQuantity` contract (#221). The hidden
+                // tranche is untouched, so the new total is
+                // `new_quantity + hidden`.
+                *visible_quantity = Quantity::new(new_quantity);
+            }
         }
     }
 
@@ -178,11 +190,11 @@ impl<T> OrderQuantity<T> for OrderType<T> {
     }
 }
 
-/// Shared Reserve-order reduction: draw the reduction from the visible
-/// tranche first, then hidden, replenishing the visible tranche when it
-/// empties while hidden remains. Used by both the user-facing
-/// `set_quantity` and the residual `set_total_remaining` — Reserve
-/// already treats its input as a total.
+/// Reserve-order reduction to a **total** target: draw the reduction from
+/// the visible tranche first, then hidden, replenishing the visible
+/// tranche when it empties while hidden remains. Used only by
+/// `set_total_remaining` for the residual resting path (#210); the
+/// user-facing `set_quantity` sets the visible tranche instead (#221).
 fn reduce_reserve_to_total<T>(order: &mut OrderType<T>, new_total_quantity: u64) {
     if let OrderType::ReserveOrder {
         visible_quantity,
@@ -248,6 +260,10 @@ where
     ///   the order always re-enters at the back of its (possibly new)
     ///   price level and loses time priority — for `Replace` and
     ///   `UpdatePriceAndQuantity` even when the price is unchanged.
+    ///   For iceberg / reserve orders `UpdatePriceAndQuantity::new_quantity`
+    ///   and `Replace::quantity` set the **visible** tranche and leave hidden
+    ///   untouched (as `UpdateQuantity` does); shape validation and risk
+    ///   admission see the resulting `visible + hidden` total.
     ///
     /// # Errors
     /// Returns [`OrderBookError::KillSwitchActive`] when the kill switch
@@ -516,7 +532,8 @@ where
                         OrderType::ReserveOrder { price, .. } => *price = new_price,
                     }
 
-                    // Update the quantity using the trait method
+                    // Two-tranche kinds take this as the visible tranche and
+                    // keep hidden untouched, like `UpdateQuantity` (#221).
                     new_order.set_quantity(new_quantity.as_u64());
 
                     // Validate-first atomic modify (#98): validate the new

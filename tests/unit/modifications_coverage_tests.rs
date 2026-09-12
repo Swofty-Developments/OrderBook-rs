@@ -204,9 +204,9 @@ mod tests {
             timestamp: TimestampMs::new(0),
             extra_fields: TestExtraFields::default(),
         };
-        reserve_order.set_quantity(80); // Reduce from 100 to 80
-        assert_eq!(reserve_order.quantity(), 10); // visible reduced by 20
-        assert_eq!(reserve_order.total_quantity(), 80); // total is now 80
+        reserve_order.set_quantity(80); // Set the visible tranche to 80
+        assert_eq!(reserve_order.quantity(), 80); // visible quantity updated
+        assert_eq!(reserve_order.total_quantity(), 150); // hidden 70 untouched
     }
 
     #[test]
