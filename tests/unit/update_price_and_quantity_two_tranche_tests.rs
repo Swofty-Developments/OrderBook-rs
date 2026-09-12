@@ -45,6 +45,10 @@ mod tests_update_price_and_quantity_two_tranche {
         let book: OrderBook<()> = DefaultOrderBook::new("TWO-TRANCHE");
         let added = book.add_order(reserve_order(id, visible, hidden, Hash32::zero()));
         assert!(added.is_ok(), "seeding the reserve order must succeed");
+        assert!(
+            book.best_ask().is_none(),
+            "no contra liquidity: an update on this book can never cross"
+        );
         book
     }
 
@@ -154,6 +158,10 @@ mod tests_update_price_and_quantity_two_tranche {
         assert_eq!(hidden_quantity.as_u64(), 5);
     }
 
+    /// Each variant runs on its own book holding a single resting reserve
+    /// order and no contra liquidity, and the price is kept at `PRICE`, so
+    /// the cancel-then-add variants re-enter without crossing and the
+    /// comparison isolates the quantity semantics.
     #[test]
     fn test_update_variants_agree_on_reserve_tranche_split() {
         let quantity_id = Id::new_uuid();
@@ -234,11 +242,12 @@ mod tests_update_price_and_quantity_two_tranche {
         let added = book.add_order(reserve_order(order_id, 5, 5, user_id));
         assert!(added.is_ok(), "seeding the reserve order must succeed");
 
-        // The projected total is 20 at 1000 ticks = 20_000 notional. Before
-        // #221 the reserve stayed at 10 units and the update went through.
+        // The re-priced projection is 20 units at 1010 ticks = 20_200
+        // notional, above the 15_000 cap. Before #221 the reserve stayed at
+        // 10 units, 10_100 at the new price, and the update went through.
         let result = book.update_order(OrderUpdate::UpdatePriceAndQuantity {
             order_id,
-            new_price: Price::new(PRICE),
+            new_price: Price::new(NEW_PRICE),
             new_quantity: Quantity::new(15),
         });
 
@@ -248,7 +257,7 @@ mod tests_update_price_and_quantity_two_tranche {
         else {
             panic!("expected the notional gate to reject the update");
         };
-        assert_eq!(attempted, 20_000);
+        assert_eq!(attempted, 20_200);
         assert_eq!(limit, 15_000);
         assert_reserve_state(&book, order_id, PRICE, 5, 5);
     }
