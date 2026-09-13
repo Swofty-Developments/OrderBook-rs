@@ -385,6 +385,19 @@ where
     ///   pricelevel < 0.9 restore a demoted order at its old
     ///   `(timestamp, seq)` position — re-snapshot to pin the corrected
     ///   order.
+    /// - [`OrderUpdate::UpdateQuantity`] with a **zero** `new_quantity`
+    ///   cancels the entire order, including the hidden quantity of an
+    ///   iceberg or reserve order. It is removed from the book, tracked as
+    ///   `Cancelled { UserRequested }`, and its id becomes reusable. This
+    ///   applies even when hidden liquidity remains: for a two-tranche
+    ///   order `new_quantity` normally resizes only the visible tranche,
+    ///   but zero is a removal, not a resize, so it is never applied to a
+    ///   tranche. A zero-quantity maker can never fill, so resting one
+    ///   only published a price level with no depth. Queue priority does
+    ///   not arise — there is no order left to hold a position — and the
+    ///   returned `Arc` is the order **as it rested**, not a projection
+    ///   resized to zero, unlike every nonzero `UpdateQuantity`, which
+    ///   returns the updated order.
     /// - [`OrderUpdate::UpdatePrice`], [`OrderUpdate::UpdatePriceAndQuantity`],
     ///   and [`OrderUpdate::Replace`] are implemented as cancel-then-add:
     ///   the order always re-enters at the back of its (possibly new)
@@ -401,21 +414,43 @@ where
     /// [`OrderUpdate::Cancel`]. Cancels are explicitly allowed so that
     /// operators can drain resting orders while new flow is halted.
     ///
-    /// [`OrderUpdate::UpdateQuantity`] is validate-first (#211): the
-    /// projected post-update order must pass the shared shape validator
-    /// (tick / lot / min-max / two-tranche representability) and the
-    /// modify-aware risk check, and any upstream
+    /// A **nonzero** [`OrderUpdate::UpdateQuantity`] is validate-first
+    /// (#211): the projected post-update order must pass the shared shape
+    /// validator (tick / lot / min-max / two-tranche representability)
+    /// and the modify-aware risk check, and any upstream
     /// [`PriceLevelError`](pricelevel::PriceLevelError) from applying the
     /// update is propagated as [`OrderBookError::PriceLevelError`] — a
     /// rejected update leaves the maker unchanged, and `Ok(None)` means
     /// only that the requested order is absent.
     ///
     /// Because the shared validator runs on the projected order, two
-    /// previously-accepted shapes are now rejected on `UpdateQuantity`
-    /// like they already were on the #98 modify paths: an
-    /// expired-but-unevicted GTD / DAY maker (`InvalidOperation`, expiry
-    /// is evaluated against the book clock) and a resting post-only maker
-    /// whose price meanwhile crosses the market (`PriceCrossing`).
+    /// previously-accepted shapes are now rejected on a nonzero
+    /// `UpdateQuantity` like they already were on the #98 modify paths:
+    /// an expired-but-unevicted GTD / DAY maker (`InvalidOperation`,
+    /// expiry is evaluated against the book clock) and a resting
+    /// post-only maker whose price meanwhile crosses the market
+    /// (`PriceCrossing`).
+    ///
+    /// A **zero** `UpdateQuantity` is a removal and runs none of that:
+    /// it bypasses the projected shape validator and the modify-aware
+    /// risk check entirely, so neither a configured `min_order_size` nor
+    /// a risk limit vetoes it, and it runs the same cancel
+    /// [`OrderBook::cancel_order`] performs (`cancel_order_with_reason`
+    /// with `UserRequested`). Only the kill-switch check above still
+    /// applies to it, because it is submitted as a modify. This removal
+    /// semantic belongs to `UpdateQuantity` alone: a zero quantity on
+    /// [`OrderUpdate::Replace`] or [`OrderUpdate::UpdatePriceAndQuantity`]
+    /// re-adds the order through validate-first, and what that produces
+    /// depends on the kind. For an iceberg or an auto-replenishing reserve
+    /// it sets the visible tranche to zero, leaves the hidden depth live
+    /// and the order keeps resting and executing; a reserve with
+    /// `auto_replenish` off is rejected with
+    /// [`OrderBookError::ZeroVisibleTranche`] and keeps resting (#230); and
+    /// a single-tranche maker is re-added carrying nothing, so the sweep
+    /// returns `remaining_quantity == 0`, the residual never rests and the
+    /// order ends as a terminal `Filled { filled_quantity: 0 }` — it
+    /// disappears with a fill status and no fill. None of the three is a
+    /// cancel, and none of them is the way to remove an order.
     ///
     /// The three cancel-then-add variants additionally run two pre-checks
     /// on the projected order, both **before** the original is cancelled so
@@ -584,6 +619,39 @@ where
                 order_id,
                 new_quantity,
             } => {
+                // A zero requested quantity is a removal, not a resize. For
+                // a one-tranche order zero is also a zero total: pricelevel
+                // keeps such a maker in its queue (`new_total <= live_total`
+                // ⇒ keep in place), so applying the update rested a maker at
+                // zero depth that held `best_bid` / `best_ask` on a level
+                // with nothing to fill, made `will_cross_market` reject a
+                // post-only at that price, and was eventually dropped by a
+                // sweep with no trade and no cancel event, leaking its
+                // `order_locations` entry (`cancel_order` then returned
+                // `Ok(None)` while a re-add of the id reported
+                // `DuplicateOrderId`). For an iceberg / reserve order the
+                // field is the visible tranche, so the projected total may
+                // be nonzero and the hidden depth would keep filling; zero
+                // still cancels the whole order by contract, hidden depth
+                // included. Cancel through `cancel_order_with_reason`, the
+                // removal `OrderBook::cancel_order` performs (not the
+                // `OrderUpdate::Cancel` arm below, which is a separate
+                // implementation). This branch runs no validator at all — a
+                // removal has no shape to validate — so a configured
+                // `min_order_size` cannot veto it. Only `UpdateQuantity` has
+                // this removal semantic: `Replace` / `UpdatePriceAndQuantity`
+                // with a zero quantity re-add the order through
+                // validate-first — an iceberg or auto-replenishing reserve
+                // rests with a zero visible tranche and its hidden depth
+                // live, a non-replenishing reserve is rejected with
+                // `ZeroVisibleTranche` and keeps resting (#230), and a
+                // single-tranche maker ends as a terminal
+                // `Filled { filled_quantity: 0 }` carrying nothing.
+                // Ungated: `update_order` holds the submit gate (#209 / #225).
+                if new_quantity.as_u64() == 0 {
+                    return self.cancel_order_with_reason(order_id, CancelReason::UserRequested);
+                }
+
                 // Get order location without locking
                 let location = self.order_locations.get(&order_id).map(|val| *val);
 
@@ -1215,19 +1283,19 @@ where
     /// refreshes `min(replenish_amount_or_default, hidden)` and re-queues.
     ///
     /// Because the rule lives here it covers
-    /// `add_order` and the projected order of every quantity-carrying modify
-    /// (`UpdateQuantity`, `UpdatePriceAndQuantity`, `Replace`), which since
-    /// #221 set the **visible** tranche and could otherwise drive a resting
-    /// reserve into that shape. Single-tranche kinds are
+    /// `add_order` and the projected order of every quantity-carrying
+    /// modify. Only `UpdatePriceAndQuantity` and `Replace` can actually
+    /// reach it: both set the **visible** tranche since #221, so a zero
+    /// quantity on either projects this shape out of a healthy resting
+    /// reserve. Single-tranche kinds are
     /// unaffected, and so is a `(0, 0)` reserve, which carries
     /// nothing to strand.
     ///
-    /// Interaction with #223: that issue gives
-    /// `UpdateQuantity { new_quantity: 0 }` a zero-is-cancel meaning. This
-    /// rejection applies to the narrowed shape on that variant only until
-    /// #223 lands, at which point a zero quantity cancels the order instead
-    /// of projecting a ghost and the rejection becomes unreachable through
-    /// `UpdateQuantity`. The other two variants are unaffected either way.
+    /// Interaction with #223: `UpdateQuantity` never reaches this rejection.
+    /// A nonzero `new_quantity` leaves a positive visible tranche, and a
+    /// zero one is a removal — the arm cancels the order through
+    /// `cancel_order_with_reason` before any validator runs — so the shape
+    /// is never projected on that variant. The other two are unaffected.
     ///
     /// # Lot size
     ///

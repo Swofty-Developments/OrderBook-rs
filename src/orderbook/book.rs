@@ -1095,9 +1095,11 @@ where
     ///   crossable-depth dry run exact, since no concurrent mutation can
     ///   move the opposite side between the estimate and the re-add's sweep.
     ///
-    /// `UpdateQuantity` adjusts a resting order in place and `Cancel`
-    /// only removes one, so neither can match and both keep the shared side
-    /// under either rule.
+    /// `UpdateQuantity` either adjusts a resting order in place or, on a
+    /// zero `new_quantity`, removes it outright (#223), and `Cancel` only
+    /// removes one. Neither variant ever re-adds an order, so neither can
+    /// match and neither needs an exclusive window: both keep the shared
+    /// side under either rule.
     ///
     /// # Why the count, not a lookup of the order being modified
     ///

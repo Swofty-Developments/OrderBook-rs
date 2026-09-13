@@ -145,8 +145,10 @@ println!("Average price: {}", result.average_price());
   The quantity supplied to these modification variants addresses the
   **visible** tranche and leaves the hidden tranche untouched:
   `OrderUpdate::UpdateQuantity`, `OrderUpdate::UpdatePriceAndQuantity` and
-  `OrderUpdate::Replace`. `add_iceberg_order` takes the visible and hidden
-  tranches as separate arguments
+  `OrderUpdate::Replace`. One exception: `UpdateQuantity` with a **zero**
+  quantity is a removal and cancels the whole order, hidden depth
+  included. `add_iceberg_order` takes the visible and hidden tranches as
+  separate arguments
 - On a book with a lot size the two tranches are validated individually,
   not on the total: a 15 visible / 5 hidden split is rejected on a lot-10
   book even though its total of 20 is a whole multiple. A Reserve order is
@@ -305,6 +307,16 @@ because the re-added order's residual would not rest and its hidden
 remainder would be destroyed; a projected full fill is allowed, and so is a
 re-price that crosses less than the visible tranche. These pre-admission
 rejections leave the original order unchanged.
+
+**Zero `UpdateQuantity`:** a zero quantity on `UpdateQuantity` is a removal,
+not a resize. It cancels the entire order (`Cancelled { UserRequested }`),
+hidden depth included, and runs no projected validation, so a configured
+`min_order_size` does not reject it; only the kill switch still refuses it,
+as it refuses every modify. This applies to `UpdateQuantity` alone: a zero
+quantity on `Replace` or `UpdatePriceAndQuantity` re-adds the order through
+validate-first, so an iceberg or auto-replenishing reserve rests with a zero
+visible tranche and its hidden depth live, while a reserve with
+`auto_replenish` off is rejected with `ZeroVisibleTranche` and keeps resting.
 
 ### Cancelling Orders
 

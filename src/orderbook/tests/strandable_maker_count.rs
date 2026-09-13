@@ -730,4 +730,59 @@ mod tests {
             "the emptied level is removed either way"
         );
     }
+
+    /// `UpdateQuantity { new_quantity: 0 }` is a removal, not a resize
+    /// (#223), and it funnels through the same `cancel_order_with_reason`
+    /// a user cancel does — so it decrements the count on the counted path,
+    /// once per maker and never twice. Two strandable makers make the
+    /// "once" observable: a double decrement on the first would close the
+    /// gate while the second is still resting.
+    #[test]
+    fn test_strandable_makers_resting_returns_to_zero_on_a_zero_quantity_update() {
+        let book: OrderBook<()> = OrderBook::new("COUNT-ZERO-UPDATE");
+        let first = Id::new();
+        let second = Id::new();
+        assert!(
+            book.add_order(reserve_buy(first, 10, 20, None, false))
+                .is_ok()
+        );
+        assert!(
+            book.add_order(reserve_buy(second, 10, 20, None, false))
+                .is_ok()
+        );
+        assert_eq!(count(&book), 2, "both strandable makers are counted");
+
+        let zero_update = |order_id: Id| {
+            book.update_order(pricelevel::OrderUpdate::UpdateQuantity {
+                order_id,
+                new_quantity: Quantity::new(0),
+            })
+        };
+
+        assert!(
+            matches!(zero_update(first), Ok(Some(_))),
+            "the zero update removes the first maker"
+        );
+        assert_eq!(count(&book), 1, "exactly one decrement");
+        assert!(
+            armed(&book),
+            "the second maker still rests, so the scan stays armed"
+        );
+
+        assert!(
+            matches!(zero_update(second), Ok(Some(_))),
+            "the zero update removes the second maker"
+        );
+        assert_eq!(count(&book), 0, "the gate closes again");
+        assert!(!armed(&book), "no scan is armed once none rest");
+
+        // Nothing is left to consume, so a later sweep cannot decrement a
+        // second time for makers this path already removed.
+        assert!(
+            book.add_limit_order(Id::new(), PRICE, 10, Side::Sell, TimeInForce::Gtc, None)
+                .is_ok(),
+            "a later sweep finds nothing to consume"
+        );
+        assert_eq!(count(&book), 0, "no second decrement");
+    }
 }

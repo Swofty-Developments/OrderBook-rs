@@ -155,10 +155,12 @@ This order book engine is built with the following design principles:
   `visible_quantity == 0` and `hidden_quantity > 0` used to rest as a
   ghost: no visible depth, and `pricelevel` removes it without a trade,
   stranding the whole hidden tranche, on the first taker to reach the
-  level. Since #221 a zero quantity on `UpdateQuantity` /
-  `UpdatePriceAndQuantity` / `Replace` could drive a healthy resting
-  reserve into that shape too. `validate_order_shape` now rejects it with
-  the new `OrderBookError::ZeroVisibleTranche`, covering `add_order`,
+  level. Since #221 a zero quantity on `UpdatePriceAndQuantity` /
+  `Replace` could drive a healthy resting reserve into that shape too;
+  `UpdateQuantity` with a zero quantity cannot, because it is a removal
+  taken before the validator runs (#223, below). `validate_order_shape`
+  now rejects it with the new `OrderBookError::ZeroVisibleTranche`,
+  covering `add_order`,
   every modify projection and snapshot restore; a rejected modify leaves
   the original resting and a rejected restore leaves the book untouched.
   The rule is that shape **only**: a zero-visible iceberg draws its whole
@@ -166,6 +168,29 @@ This order book engine is built with the following design principles:
   auto-replenishing reserve refreshes and re-queues, so both execute and
   stay admissible. Single-tranche kinds are unaffected. Maps to the
   existing `RejectReason::InvalidQuantity`.
+- **`OrderUpdate::UpdateQuantity` with a zero quantity cancels the order
+  (#223).** A zero `new_quantity` was accepted and applied as a resize:
+  `pricelevel` keeps a non-growing total in place, so the maker rested at
+  zero depth, held `best_bid` / `best_ask` on a level with nothing behind
+  it and was later dropped by a sweep with no trade and no cancel event,
+  leaking its `order_locations` entry — `cancel_order` then returned
+  `Ok(None)` while re-adding the id reported `DuplicateOrderId`. The arm
+  now routes to the same `UserRequested` cancel `OrderBook::cancel_order`
+  performs, so the level-change event, the `Cancelled { UserRequested }`
+  transition, the per-account risk release, the location / user-index
+  untrack and the empty-level removal happen in lockstep. **A zero
+  requested quantity is a removal, not a resize:** it cancels the
+  *entire* order, hidden depth of an iceberg or reserve included (a
+  nonzero `new_quantity` still resizes only the visible tranche), and it
+  runs neither the projected-order validator nor the modify-aware risk
+  check, so neither a configured `min_order_size` nor a risk limit vetoes
+  it. The kill switch still refuses it, as it refuses every modify. The
+  removal semantic is `UpdateQuantity`'s alone: a zero quantity on
+  `Replace` / `UpdatePriceAndQuantity` re-adds through validate-first
+  (#230 above). Compatibility: a journal recorded before this change that
+  contains a zero `UpdateQuantity` replays to the new outcome, so the
+  replayed book legitimately differs from the one the original run
+  produced.
 - **Reserve `UpdatePriceAndQuantity` honours the requested visible
   quantity (#221).** `OrderQuantity::set_quantity` read a reserve's
   argument as a **total** target and only ever reduced, so a requested

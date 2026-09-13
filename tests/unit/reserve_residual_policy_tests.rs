@@ -19,11 +19,16 @@
 //!   tranche means the residual does **not** rest and its hidden remainder
 //!   is discarded.
 //!
-//! Admission closes the matching hole: a two-tranche order (iceberg or
-//! reserve) submitted with a zero visible tranche behind hidden quantity is
-//! rejected with `OrderBookError::ZeroVisibleTranche`, on `add_order` and on
-//! every quantity-carrying modify projection. Single-tranche kinds are out
-//! of scope, and so is a `(0, 0)` order, which strands nothing.
+//! Admission closes the matching hole for the one shape that cannot
+//! execute: a **non-auto-replenishing** reserve submitted with a zero
+//! visible tranche behind hidden quantity is rejected with
+//! `OrderBookError::ZeroVisibleTranche`, on `add_order` and on every modify
+//! projection the validator sees. An iceberg and an auto-replenishing
+//! reserve in the same shape execute rather than vanishing, so both stay
+//! admissible. Single-tranche kinds are out of scope, and so is a `(0, 0)`
+//! order, which strands nothing. `UpdateQuantity` with a zero quantity is a
+//! removal taken before the validator ever runs (#223), so the rule never
+//! sees it.
 //!
 //! Every case asserts the accounting rule
 //! `submitted = executed + resting (visible + hidden) + discarded` with
@@ -846,10 +851,12 @@ mod tests_reserve_residual_policy {
         );
     }
 
-    /// Every quantity-carrying modify projects the updated order through the
+    /// The two cancel-then-add arms project the updated order through the
     /// same validator, and since #221 the quantity sets the **visible**
-    /// tranche, so a zero would drive a healthy resting order into the ghost
-    /// shape. All three arms reject it and leave the original untouched.
+    /// tranche, so a zero would drive a healthy resting reserve into the
+    /// ghost shape. Both reject it and leave the original untouched. The
+    /// third quantity-carrying arm, `UpdateQuantity`, removes the order
+    /// instead (#223) and is exercised at the end.
     #[test]
     fn test_update_order_non_auto_reserve_zero_quantity_rejects_and_preserves_original() {
         {
@@ -860,13 +867,6 @@ mod tests_reserve_residual_policy {
             assert!(rested.is_ok(), "{kind}: seeding must succeed: {rested:?}");
 
             let updates = [
-                (
-                    "UpdateQuantity",
-                    OrderUpdate::UpdateQuantity {
-                        order_id,
-                        new_quantity: Quantity::new(0),
-                    },
-                ),
                 (
                     "UpdatePriceAndQuantity",
                     OrderUpdate::UpdatePriceAndQuantity {
@@ -917,13 +917,40 @@ mod tests_reserve_residual_policy {
                     "{kind} / {label}: the level must survive"
                 );
             }
+
+            // `UpdateQuantity` with a zero quantity is a removal (#223): it
+            // runs before the projected-shape validator, so the
+            // `ZeroVisibleTranche` rule never sees it and the whole order
+            // is cancelled, hidden depth included.
+            let removed = book
+                .update_order(OrderUpdate::UpdateQuantity {
+                    order_id,
+                    new_quantity: Quantity::new(0),
+                })
+                .unwrap_or_else(|e| panic!("{kind} / UpdateQuantity: zero is a removal: {e:?}"))
+                .unwrap_or_else(|| {
+                    panic!("{kind} / UpdateQuantity: the cancelled order is returned")
+                });
+            assert_eq!(removed.id(), order_id);
+            assert!(
+                book.get_order(order_id).is_none(),
+                "{kind} / UpdateQuantity: the whole order is cancelled"
+            );
+            assert_eq!(
+                book.best_bid(),
+                None,
+                "{kind} / UpdateQuantity: the level goes with it"
+            );
         }
     }
 
-    /// The iceberg arm of the same update keeps its pre-#230 outcome: a zero
-    /// quantity is **accepted**, leaving 0 visible / 20 hidden, because that
-    /// shape executes rather than vanishing (the hidden tranche is drawn into
-    /// visible on match). The rule narrowed to the non-auto reserve alone.
+    /// The iceberg arm of the cancel-then-add variants keeps its pre-#230
+    /// outcome: a zero quantity is **accepted**, leaving 0 visible / 20
+    /// hidden, because that shape executes rather than vanishing (the hidden
+    /// tranche is drawn into visible on match). The rule narrowed to the
+    /// non-auto reserve alone. (`UpdateQuantity` with zero is a removal on
+    /// every kind since #223, so it is exercised through
+    /// `UpdatePriceAndQuantity` here.)
     #[test]
     fn test_update_order_iceberg_zero_quantity_accepts_and_leaves_hidden_intact() {
         let book = tracked_book("ZERO-VIS-MODIFY-ICE");
@@ -931,8 +958,9 @@ mod tests_reserve_residual_policy {
         let rested = book.add_order(iceberg_buy(order_id, PRICE, VISIBLE, HIDDEN));
         assert!(rested.is_ok(), "seeding must succeed: {rested:?}");
 
-        let updated = book.update_order(OrderUpdate::UpdateQuantity {
+        let updated = book.update_order(OrderUpdate::UpdatePriceAndQuantity {
             order_id,
+            new_price: Price::new(PRICE),
             new_quantity: Quantity::new(0),
         });
         assert!(
