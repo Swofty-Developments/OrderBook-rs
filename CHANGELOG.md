@@ -75,8 +75,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Self-trade prevention fires only on a same-user maker the taker can
-  reach (#222).** `check_stp_at_level` reports a conflict whenever a
+- **`STPMode::CancelTaker` and `STPMode::CancelBoth` fire only on a
+  same-user maker the taker can reach (#222).** Scope: those two modes.
+  `STPMode::CancelMaker` is deliberately unchanged and still cancels every
+  same-user order at a level the sweep touches, reachable or not — it never
+  destroys the taker, so the gate would only change which resting orders
+  survive. `check_stp_at_level` reports a conflict whenever a
   same-user maker rests at a crossed level, and the `CancelTaker` /
   `CancelBoth` arms then cancelled the taker (and, under `CancelBoth`, the
   maker) unconditionally after their safe-quantity pre-match. A taker the
@@ -105,15 +109,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `check_stp_at_level` verdict, so a reprice the non-self depth covers is
   admitted, one it does not cover is still refused before the original is
   cancelled, and dust the sweep stops on before a deeper same-user level
-  is admitted exactly as a direct submit is. Pinned for base-quantity,
+  is admitted exactly as a direct submit is. The pre-match is sized by
+  `PriceLevel::matchable_quantity` — the authoritative dry run the
+  no-conflict arm already used — bounded by the non-self prefix, not by
+  `safe_quantity` itself. That sum counts *visible* quantity and can
+  overstate what the sweep executes (a no-progress maker is set aside; a
+  replenish whose checked net delta would overflow the level's visible
+  counter aborts the sweep untouched, #124), and overstating it admitted a
+  reprice the sweep then killed after the original was already cancelled —
+  the destruction #168 exists to prevent. Pinned for base-quantity,
   fill-or-kill and market takers, quote-amount buys (dust and reachable),
   a quote-amount sell past an unaffordable self level, a lot-rounded
   notional residual, a sub-lot reserve tranche resting from before a
   lot-size change (sweep and reprice),
   precheck/sweep agreement on dust before a deeper self level, the
-  exact-depth boundary, and same-level reprices (admitted and refused); a
+  exact-depth boundary, a maker ahead that is counted in `safe_quantity`
+  yet delivers nothing (the #124 replenish-headroom abort, where the
+  reprice is now refused with the original left resting), and same-level
+  reprices (admitted and refused); a
   reachable maker still yields `SelfTradePrevented` with the true non-self
-  fill.
+  fill. The notional-sell walk is pinned on a plain STP-off book too, since
+  the walk direction and not the STP mode decides the zero-cap verdict.
 
   The same walk had a second, older bug the reachability guards exposed:
   a zero per-level cap ended the whole sweep, which is right for a
@@ -125,8 +141,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   executed one unit instead of two. The direction-aware decision now
   lives in `StopCondition::zero_cap_is_terminal`, and the walk skips the
   level instead of breaking when a notional sell can still reach cheaper
-  bids; a small notional sell budget may therefore visit every remaining
-  bid level, bounded by the level count the sweep would traverse anyway.
+  bids. Its exact terminal condition is `remaining < lot`: the cheapest a
+  level can be is a price of 1, where the cap is the whole remaining
+  notional, so below one lot no level still ahead can execute. With no lot
+  size configured that reduces to a spent budget, which the loop's own
+  completion check reaches first, so a notional sell then ends only on a
+  spent budget or an exhausted side and visits every level on that side.
+  Each skipped level costs one `u128` division and mutates nothing.
 
 - **A reserve residual follows `auto_replenish` (#230).**
   `reduce_reserve_to_total` — the residual-resting helper behind

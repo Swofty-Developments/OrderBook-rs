@@ -3209,11 +3209,29 @@ where
 
     /// Match a market order specified by quote-notional amount.
     ///
-    /// Walks the opposite side until the requested `amount` is consumed,
-    /// the book is exhausted, or — when [`Self::lot_size`] is configured —
-    /// the remaining notional cannot fund another whole lot. This is the
-    /// classic Binance-style `quoteOrderQty` semantics: callers say "buy
-    /// ~$1,000 of BTC" without converting to base quantity.
+    /// Walks the opposite side until the requested `amount` is consumed or
+    /// the book is exhausted. This is the classic Binance-style
+    /// `quoteOrderQty` semantics: callers say "buy ~$1,000 of BTC" without
+    /// converting to base quantity.
+    ///
+    /// A level whose price the remaining notional cannot afford — one whole
+    /// lot when [`Self::lot_size`] is configured, one unit otherwise — is
+    /// handled according to the direction of the walk, because the levels
+    /// still ahead are ordered by price:
+    ///
+    /// - A **buy** walks asks ascending, so every level still ahead is
+    ///   dearer. An unaffordable ask ends the walk; the unspent remainder
+    ///   is dust returned to the caller.
+    /// - A **sell** walks bids descending, so every level still ahead is
+    ///   cheaper. An unaffordable bid is **skipped** and the walk continues
+    ///   to the next one, which may well be affordable. It ends only when
+    ///   the budget is spent, the bid side is exhausted, or the remaining
+    ///   notional is below one lot, at which point no price could fund a
+    ///   lot. Selling 150 into bids of 100, 75 and 50 therefore executes one
+    ///   unit at 100 and one at 50, leaving the bid at 75 untouched.
+    ///
+    /// The sell walk can consequently visit every level resting on the bid
+    /// side. Each skipped level costs one division and mutates nothing.
     ///
     /// Bypasses STP (uses `Hash32::zero()`); use
     /// [`Self::match_market_order_by_amount_with_user`] when STP is
@@ -3235,9 +3253,11 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`OrderBookError::InsufficientLiquidityNotional`] when the
-    /// book had zero matchable depth (empty or all levels priced beyond
-    /// the per-level lot affordable from `amount`).
+    /// Returns [`OrderBookError::InsufficientLiquidityNotional`] when no
+    /// trade occurred: the side is empty, or no level the walk reached was
+    /// affordable. For a buy that means the best ask alone was already
+    /// beyond `amount`; for a sell it means no bid on the whole side was,
+    /// since the walk descends past the ones it cannot afford.
     pub fn match_market_order_by_amount(
         &self,
         order_id: Id,
