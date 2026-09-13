@@ -19,11 +19,16 @@
 //!   tranche means the residual does **not** rest and its hidden remainder
 //!   is discarded.
 //!
-//! Admission closes the matching hole: a two-tranche order (iceberg or
-//! reserve) submitted with a zero visible tranche behind hidden quantity is
-//! rejected with `OrderBookError::ZeroVisibleTranche`, on `add_order` and on
-//! every quantity-carrying modify projection. Single-tranche kinds are out
-//! of scope, and so is a `(0, 0)` order, which strands nothing.
+//! Admission closes the matching hole for the one shape that cannot
+//! execute: a **non-auto-replenishing** reserve submitted with a zero
+//! visible tranche behind hidden quantity is rejected with
+//! `OrderBookError::ZeroVisibleTranche`, on `add_order` and on every modify
+//! projection the validator sees. An iceberg and an auto-replenishing
+//! reserve in the same shape execute rather than vanishing, so both stay
+//! admissible. Single-tranche kinds are out of scope, and so is a `(0, 0)`
+//! order, which strands nothing. `UpdateQuantity` with a zero quantity is a
+//! removal taken before the validator ever runs (#223), so the rule never
+//! sees it.
 //!
 //! Every case asserts the accounting rule
 //! `submitted = executed + resting (visible + hidden) + discarded` with
@@ -846,10 +851,12 @@ mod tests_reserve_residual_policy {
         );
     }
 
-    /// Every quantity-carrying modify projects the updated order through the
+    /// The two cancel-then-add arms project the updated order through the
     /// same validator, and since #221 the quantity sets the **visible**
-    /// tranche, so a zero would drive a healthy resting order into the ghost
-    /// shape. All three arms reject it and leave the original untouched.
+    /// tranche, so a zero would drive a healthy resting reserve into the
+    /// ghost shape. Both reject it and leave the original untouched. The
+    /// third quantity-carrying arm, `UpdateQuantity`, removes the order
+    /// instead (#223) and is exercised at the end.
     #[test]
     fn test_update_order_non_auto_reserve_zero_quantity_rejects_and_preserves_original() {
         {
