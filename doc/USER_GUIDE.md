@@ -314,8 +314,9 @@ hidden depth included, and runs no projected validation, so a configured
 `min_order_size` does not reject it; only the kill switch still refuses it,
 as it refuses every modify. This applies to `UpdateQuantity` alone: a zero
 quantity on `Replace` or `UpdatePriceAndQuantity` re-adds the order through
-validate-first and, for a two-tranche order, sets the visible tranche to
-zero while the hidden depth stays live.
+validate-first, so an iceberg or auto-replenishing reserve rests with a zero
+visible tranche and its hidden depth live, while a reserve with
+`auto_replenish` off is rejected with `ZeroVisibleTranche` and keeps resting.
 
 ### Cancelling Orders
 

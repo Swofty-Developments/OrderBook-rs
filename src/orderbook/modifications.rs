@@ -436,9 +436,11 @@ where
     /// applies to it, because it is submitted as a modify. This removal
     /// semantic belongs to `UpdateQuantity` alone: a zero quantity on
     /// [`OrderUpdate::Replace`] or [`OrderUpdate::UpdatePriceAndQuantity`]
-    /// re-adds the order through validate-first and, for a two-tranche
-    /// order, sets the visible tranche to zero while the hidden depth
-    /// stays live.
+    /// re-adds the order through validate-first, so for an iceberg or an
+    /// auto-replenishing reserve it sets the visible tranche to zero and
+    /// leaves the hidden depth live, while a reserve with `auto_replenish`
+    /// off is rejected with [`OrderBookError::ZeroVisibleTranche`] and
+    /// keeps resting (#230).
     ///
     /// The three cancel-then-add variants additionally run two pre-checks
     /// on the projected order, both **before** the original is cancelled so
@@ -629,8 +631,10 @@ where
                 // `min_order_size` cannot veto it. Only `UpdateQuantity` has
                 // this removal semantic: `Replace` / `UpdatePriceAndQuantity`
                 // with a zero quantity re-add the order through
-                // validate-first, and for a two-tranche order they set the
-                // visible tranche to zero and leave the hidden depth live.
+                // validate-first — an iceberg or auto-replenishing reserve
+                // rests with a zero visible tranche and its hidden depth
+                // live, a non-replenishing reserve is rejected with
+                // `ZeroVisibleTranche` and keeps resting (#230).
                 // Ungated: `update_order` holds the submit gate (#209 / #225).
                 if new_quantity.as_u64() == 0 {
                     return self.cancel_order_with_reason(order_id, CancelReason::UserRequested);

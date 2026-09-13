@@ -60,7 +60,10 @@ mod tests_update_quantity_zero {
             "no ghost order"
         );
         assert_eq!(book.best_ask(), None, "no phantom level at zero depth");
-        assert!(book.get_asks().is_empty(), "the empty level was removed");
+        assert!(
+            book.create_snapshot(usize::MAX).asks.is_empty(),
+            "the empty level was removed"
+        );
         assert_eq!(
             book.order_status(Id::from_u64(MAKER)),
             Some(OrderStatus::Cancelled {
@@ -177,7 +180,10 @@ mod tests_update_quantity_zero {
             "the whole order is gone, hidden depth included"
         );
         assert_eq!(book.best_ask(), None, "no level survives on hidden depth");
-        assert!(book.get_asks().is_empty(), "the empty level was removed");
+        assert!(
+            book.create_snapshot(usize::MAX).asks.is_empty(),
+            "the empty level was removed"
+        );
         assert_eq!(
             book.order_status(Id::from_u64(MAKER)),
             Some(OrderStatus::Cancelled {

@@ -480,8 +480,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejects it with `OrderSizeOutOfRange`. The kill switch still refuses it,
   as it refuses every modify. The removal semantic is `UpdateQuantity`'s
   alone: a zero quantity on `Replace` / `UpdatePriceAndQuantity` re-adds
-  through validate-first and, for a two-tranche order, zeroes the visible
-  tranche while the hidden depth stays live. Pinned for plain, iceberg and
+  through validate-first, so an iceberg or auto-replenishing reserve rests
+  with a zero visible tranche and its hidden depth live, while a
+  non-replenishing reserve is rejected with `ZeroVisibleTranche` and keeps
+  resting (#230). Pinned for plain, iceberg and
   reserve makers, a `min_order_size` book, a shared level, an absent id and
   an engaged kill switch.
 
