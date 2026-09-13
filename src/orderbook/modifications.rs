@@ -1552,6 +1552,16 @@ where
             // before it scans another level (it rests, STP never consulted),
             // so neither can reach a same-user maker → the engine never
             // cancels the taker.
+            //
+            // Returning here — rather than skipping the level — also matches
+            // the sweep's `StopCondition::zero_cap_is_terminal`: a modify is
+            // always a base-quantity taker, and a base cap is the lot-rounded
+            // residual, independent of the level price. Zero here is zero at
+            // every level still ahead whichever way the walk runs, so there
+            // is no side asymmetry to mirror. Only the sweep's
+            // quote-notional sell arm keeps walking on a zero cap, because
+            // its per-level cap rises again as bids get cheaper, and no
+            // modify ever takes that arm.
             let cap = if lot <= 1 {
                 remaining
             } else {

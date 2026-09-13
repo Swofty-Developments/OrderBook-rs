@@ -243,6 +243,43 @@ impl StopCondition {
     fn is_dust_at(&self, level_price: u128, lot: u64) -> bool {
         matches!(self, Self::QuoteAmount { .. }) && self.level_qty_cap(level_price, lot) == 0
     }
+
+    /// Whether a zero [`Self::level_qty_cap`] at the level the walk is
+    /// standing on ends the whole walk, or only this level.
+    ///
+    /// The taker's side fixes the walk direction and therefore the price
+    /// monotonicity of the levels still ahead: a buy taker walks asks
+    /// ascending, so every later level is **dearer**; a sell taker walks
+    /// bids descending, so every later level is **cheaper**.
+    ///
+    /// - `BaseQty`: the cap is the lot-rounded residual and does not depend
+    ///   on the level price at all. Zero here is zero at every remaining
+    ///   level whichever way the walk runs, so it is terminal on both sides.
+    /// - `QuoteAmount` on a buy: the cap is `remaining / level_price`, which
+    ///   is non-increasing as the walk moves to dearer asks. A budget that
+    ///   cannot fund one lot here funds even less further on, so zero is
+    ///   terminal.
+    /// - `QuoteAmount` on a sell: the walk moves to cheaper bids, so
+    ///   `remaining / level_price` can rise again. A budget that cannot fund
+    ///   one lot at this bid may fund a whole one at a lower bid, so the
+    ///   level is skipped and the walk continues.
+    ///
+    /// Consequence of the sell arm: a small notional budget can now visit
+    /// every remaining bid level before the sweep ends, instead of stopping
+    /// at the first unaffordable one. That is the price of filling what the
+    /// budget can actually afford, and it is bounded by the level count the
+    /// sweep would traverse anyway.
+    ///
+    /// Only ever consulted when the cap is already zero, so the base-qty
+    /// hot path (`lot <= 1`, cap equal to the residual) never evaluates it.
+    #[inline]
+    #[must_use]
+    fn zero_cap_is_terminal(&self, taker_side: Side) -> bool {
+        match self {
+            Self::BaseQty { .. } => true,
+            Self::QuoteAmount { .. } => matches!(taker_side, Side::Buy),
+        }
+    }
 }
 
 impl<T> OrderBook<T>
@@ -508,10 +545,17 @@ where
 
             // Compute per-level base-qty cap respecting both the budget
             // (base-qty or notional) and `lot_size`. A zero cap means
-            // dust-below-lot at the current price ⇒ stop walking.
+            // dust-below-lot at the current price: nothing can execute
+            // *here*. Whether that also ends the walk depends on the
+            // direction it runs in — a notional sell keeps descending to
+            // cheaper bids, everything else stops. See
+            // `StopCondition::zero_cap_is_terminal`.
             let qty_cap = stop.level_qty_cap(price, lot);
             if qty_cap == 0 {
-                break;
+                if stop.zero_cap_is_terminal(side) {
+                    break;
+                }
+                continue;
             }
 
             // Get price level value from the entry
@@ -1451,5 +1495,50 @@ mod stop_condition_tests {
     fn test_is_done_quote_amount() {
         assert!(StopCondition::QuoteAmount { remaining: 0 }.is_done());
         assert!(!StopCondition::QuoteAmount { remaining: 1 }.is_done());
+    }
+
+    #[test]
+    fn test_zero_cap_is_terminal_for_base_qty_on_both_sides() {
+        // The base cap is the lot-rounded residual and ignores the level
+        // price, so a zero cap stays zero whichever way the walk runs.
+        let stop = StopCondition::BaseQty { remaining: 5 };
+        assert_eq!(stop.level_qty_cap(50, 100), 0);
+        assert_eq!(stop.level_qty_cap(1, 100), 0);
+        assert!(stop.zero_cap_is_terminal(Side::Buy));
+        assert!(stop.zero_cap_is_terminal(Side::Sell));
+    }
+
+    #[test]
+    fn test_zero_cap_is_terminal_for_quote_amount_on_a_buy() {
+        // Buy walks asks ascending: 50 cannot fund a unit at 100 and funds
+        // even less at the dearer 200 the walk would visit next.
+        let stop = StopCondition::QuoteAmount { remaining: 50 };
+        assert_eq!(stop.level_qty_cap(100, 1), 0);
+        assert_eq!(stop.level_qty_cap(200, 1), 0);
+        assert!(stop.zero_cap_is_terminal(Side::Buy));
+    }
+
+    #[test]
+    fn test_zero_cap_is_not_terminal_for_quote_amount_on_a_sell() {
+        // Sell walks bids descending: 50 cannot fund a unit at 75 but funds
+        // exactly one at the cheaper 50 the walk would visit next, so the
+        // unaffordable level must be skipped rather than end the walk.
+        let stop = StopCondition::QuoteAmount { remaining: 50 };
+        assert_eq!(stop.level_qty_cap(75, 1), 0);
+        assert_eq!(stop.level_qty_cap(50, 1), 1);
+        assert!(!stop.zero_cap_is_terminal(Side::Sell));
+    }
+
+    #[test]
+    fn test_zero_cap_is_not_terminal_for_a_lot_rounded_quote_sell() {
+        // Same rule under lot rounding: 500 caps at 500/75 = 6, rounded
+        // down to a lot of 5 that is still 5 — affordable. Push the price
+        // to 200 and the cap is 2, which rounds to 0; at the cheaper 100
+        // it is 5 again, so the walk must go on.
+        let stop = StopCondition::QuoteAmount { remaining: 500 };
+        assert_eq!(stop.level_qty_cap(200, 5), 0);
+        assert_eq!(stop.level_qty_cap(100, 5), 5);
+        assert!(!stop.zero_cap_is_terminal(Side::Sell));
+        assert!(stop.zero_cap_is_terminal(Side::Buy));
     }
 }

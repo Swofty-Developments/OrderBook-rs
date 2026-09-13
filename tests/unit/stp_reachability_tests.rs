@@ -356,6 +356,290 @@ mod tests_stp_reachability {
         }
     }
 
+    /// The sell walk must also step over a level it simply cannot afford,
+    /// not only over the level its own maker rests on. Bids: 100 holding one
+    /// lot from another user then one from the taker, 75 holding one lot
+    /// from another user, 50 holding one lot from another user. The taker
+    /// sells a quote amount of 150.
+    ///
+    /// Derivation from `match_order_inner`'s walk, which visits bids
+    /// descending:
+    /// - 100: cap = 150 / 100 = 1. `check_stp_at_level` reports the
+    ///   same-user maker with `safe_quantity` = 1, the non-self depth queued
+    ///   ahead of it, so the sweep pre-matches min(1, 1) = 1 unit at 100 and
+    ///   the budget falls to 150 - 100 = 50. 50 cannot fund another unit at
+    ///   100, so the maker is unreachable: it survives and the arm walks on.
+    /// - 75: cap = 50 / 75 = 0. Nothing can execute here, but a zero
+    ///   notional cap on a sell is not terminal, because the bids still
+    ///   ahead are cheaper. The level is skipped untouched instead of ending
+    ///   the sweep. This is the step the fix adds; before it the outer cap
+    ///   guard broke here and the sweep ended with 1 unit executed.
+    /// - 50: cap = 50 / 50 = 1. No same-user maker here, so 1 unit executes
+    ///   and the budget reaches exactly 0, ending the walk.
+    ///
+    /// Expected: 2 units executed for 150 quote spent, one at 100 and one at
+    /// 50; the bid at 75 still resting untouched; the same-user bid at 100
+    /// still resting and never cancelled; the taker returned `Ok` and never
+    /// recorded as self-trade-prevented.
+    #[test]
+    fn quote_amount_sell_walks_past_an_intermediate_unaffordable_level() {
+        const OTHER_AT_100: u64 = 21;
+        const SELF_AT_100: u64 = 22;
+        const OTHER_AT_75: u64 = 23;
+        const OTHER_AT_50: u64 = 24;
+
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let mut book: OrderBook<()> = DefaultOrderBook::new("STPW");
+            book.set_stp_mode(mode);
+            book.set_order_state_tracker(OrderStateTracker::new());
+            for (id, price, owner) in [
+                (OTHER_AT_100, 100u128, user(2)),
+                (SELF_AT_100, 100, user(1)),
+                (OTHER_AT_75, 75, user(2)),
+                (OTHER_AT_50, 50, user(2)),
+            ] {
+                book.add_limit_order_with_user(
+                    Id::from_u64(id),
+                    price,
+                    1,
+                    Side::Buy,
+                    TimeInForce::Gtc,
+                    owner,
+                    None,
+                )
+                .expect("seed bid");
+            }
+
+            let result = book
+                .submit_market_order_by_amount_with_user(
+                    Id::from_u64(TAKER),
+                    150,
+                    Side::Sell,
+                    user(1),
+                )
+                .unwrap_or_else(|e| panic!("{mode}: the sweep skips 75 and reaches 50, got {e:?}"));
+
+            assert_eq!(
+                executed(&result),
+                2,
+                "{mode}: one unit at 100 and one at 50"
+            );
+            let spent: u128 = result
+                .trades()
+                .as_vec()
+                .iter()
+                .map(|t| t.price().as_u128() * u128::from(t.quantity().as_u64()))
+                .sum();
+            assert_eq!(spent, 150, "{mode}: the whole notional budget was spent");
+
+            assert!(
+                book.get_order(Id::from_u64(OTHER_AT_100)).is_none(),
+                "{mode}: the non-self bid at 100 was consumed"
+            );
+            assert!(
+                book.get_order(Id::from_u64(OTHER_AT_50)).is_none(),
+                "{mode}: the bid at 50 was consumed"
+            );
+
+            let skipped = book
+                .get_order(Id::from_u64(OTHER_AT_75))
+                .unwrap_or_else(|| {
+                    panic!("{mode}: the unaffordable bid at 75 is skipped, not hit")
+                });
+            assert_eq!(
+                skipped.visible_quantity().as_u64(),
+                1,
+                "{mode}: the skipped level is left untouched"
+            );
+
+            let self_bid = book
+                .get_order(Id::from_u64(SELF_AT_100))
+                .unwrap_or_else(|| panic!("{mode}: the unreachable same-user bid survives"));
+            assert_eq!(
+                self_bid.visible_quantity().as_u64(),
+                1,
+                "{mode}: the unreachable maker is neither filled nor cancelled"
+            );
+            assert!(
+                !matches!(
+                    book.order_status(Id::from_u64(SELF_AT_100)),
+                    Some(OrderStatus::Cancelled { .. })
+                ),
+                "{mode}: no cancel recorded for an unreachable maker"
+            );
+            assert!(
+                !matches!(
+                    book.order_status(Id::from_u64(TAKER)),
+                    Some(OrderStatus::Cancelled {
+                        reason: CancelReason::SelfTradePrevention,
+                        ..
+                    })
+                ),
+                "{mode}: the taker never reached its own maker, so it is not STP-cancelled"
+            );
+            assert_eq!(
+                book.best_bid(),
+                Some(100),
+                "{mode}: the self bid still tops the book"
+            );
+        }
+    }
+
+    /// The buy twin: the ascending walk must still stop, because every ask
+    /// still ahead is dearer than the one the budget already cannot afford.
+    /// Asks: 100 holding one lot from another user then one from the taker,
+    /// 125 and 150 each holding one lot from another user. The taker buys a
+    /// quote amount of 150.
+    ///
+    /// Derivation, asks ascending:
+    /// - 100: cap = 150 / 100 = 1, `safe_quantity` = 1, so 1 unit executes
+    ///   and the budget falls to 150 - 100 = 50. 50 cannot fund another unit
+    ///   at 100, so the same-user maker is unreachable and survives.
+    /// - 125: cap = 50 / 125 = 0, and a zero notional cap on a buy is
+    ///   terminal. The sweep ends here.
+    ///
+    /// Expected: 1 unit executed for 100 quote spent, both asks past 100
+    /// still resting untouched, the same-user ask at 100 still resting.
+    #[test]
+    fn quote_amount_buy_stops_at_the_first_unaffordable_level() {
+        const OTHER_AT_100: u64 = 31;
+        const SELF_AT_100: u64 = 32;
+        const OTHER_AT_125: u64 = 33;
+        const OTHER_AT_150: u64 = 34;
+
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let mut book: OrderBook<()> = DefaultOrderBook::new("STPX");
+            book.set_stp_mode(mode);
+            book.set_order_state_tracker(OrderStateTracker::new());
+            for (id, price, owner) in [
+                (OTHER_AT_100, 100u128, user(2)),
+                (SELF_AT_100, 100, user(1)),
+                (OTHER_AT_125, 125, user(2)),
+                (OTHER_AT_150, 150, user(2)),
+            ] {
+                book.add_limit_order_with_user(
+                    Id::from_u64(id),
+                    price,
+                    1,
+                    Side::Sell,
+                    TimeInForce::Gtc,
+                    owner,
+                    None,
+                )
+                .expect("seed ask");
+            }
+
+            let result = book
+                .submit_market_order_by_amount_with_user(
+                    Id::from_u64(TAKER),
+                    150,
+                    Side::Buy,
+                    user(1),
+                )
+                .unwrap_or_else(|e| panic!("{mode}: the fill at 100 makes this Ok, got {e:?}"));
+
+            assert_eq!(
+                executed(&result),
+                1,
+                "{mode}: only the non-self ask at 100 is affordable"
+            );
+            let spent: u128 = result
+                .trades()
+                .as_vec()
+                .iter()
+                .map(|t| t.price().as_u128() * u128::from(t.quantity().as_u64()))
+                .sum();
+            assert_eq!(spent, 100, "{mode}: 50 of the budget is left unspendable");
+
+            assert!(
+                book.get_order(Id::from_u64(OTHER_AT_100)).is_none(),
+                "{mode}: the non-self ask at 100 was consumed"
+            );
+            for (id, label) in [(OTHER_AT_125, 125u128), (OTHER_AT_150, 150)] {
+                let ask = book
+                    .get_order(Id::from_u64(id))
+                    .unwrap_or_else(|| panic!("{mode}: the ask at {label} is never reached"));
+                assert_eq!(
+                    ask.visible_quantity().as_u64(),
+                    1,
+                    "{mode}: nothing executed past the unaffordable ask"
+                );
+            }
+            let self_ask = book
+                .get_order(Id::from_u64(SELF_AT_100))
+                .unwrap_or_else(|| panic!("{mode}: the unreachable same-user ask survives"));
+            assert_eq!(
+                self_ask.visible_quantity().as_u64(),
+                1,
+                "{mode}: the unreachable maker is neither filled nor cancelled"
+            );
+            assert!(
+                !matches!(
+                    book.order_status(Id::from_u64(SELF_AT_100)),
+                    Some(OrderStatus::Cancelled { .. })
+                ),
+                "{mode}: no cancel recorded for an unreachable maker"
+            );
+        }
+    }
+
+    /// A base-quantity residual below one lot still ends the walk on either
+    /// side: its per-level cap is the lot-rounded residual, which does not
+    /// depend on the level price, so a cheaper bid cannot rescue it.
+    ///
+    /// Bids 100 holding 3 from another user and 50 holding 5 from another
+    /// user, both seeded before the lot size becomes 5 (a maker admitted
+    /// before a lot change keeps its misaligned tranche). The taker sells 5
+    /// base.
+    ///
+    /// Derivation, bids descending:
+    /// - 100: cap = 5 - (5 % 5) = 5, the level offers 3, so 3 execute and
+    ///   the residual is 2.
+    /// - 50: cap = 2 - (2 % 5) = 0. Base-quantity zero caps are terminal on
+    ///   both sides, so the sweep breaks without touching the level.
+    ///
+    /// Expected: 3 units executed at 100, the bid at 50 still resting with
+    /// its full 5.
+    #[test]
+    fn base_quantity_sub_lot_residual_still_ends_the_sell_walk() {
+        const OTHER_AT_100: u64 = 41;
+        const OTHER_AT_50: u64 = 42;
+
+        let mut book: OrderBook<()> = DefaultOrderBook::new("STPY");
+        book.set_order_state_tracker(OrderStateTracker::new());
+        for (id, price, qty) in [(OTHER_AT_100, 100u128, 3u64), (OTHER_AT_50, 50, 5)] {
+            book.add_limit_order_with_user(
+                Id::from_u64(id),
+                price,
+                qty,
+                Side::Buy,
+                TimeInForce::Gtc,
+                user(2),
+                None,
+            )
+            .expect("seed bid before the lot size is set");
+        }
+        book.set_lot_size(5);
+
+        let result = book
+            .submit_market_order_with_user(Id::from_u64(TAKER), 5, Side::Sell, user(1))
+            .expect("the partial fill at 100 makes this Ok");
+
+        assert_eq!(executed(&result), 3, "only the 3 resting at 100 are filled");
+        assert!(
+            book.get_order(Id::from_u64(OTHER_AT_100)).is_none(),
+            "the bid at 100 was consumed"
+        );
+        let untouched = book
+            .get_order(Id::from_u64(OTHER_AT_50))
+            .expect("the sub-lot residual never reaches the bid at 50");
+        assert_eq!(
+            untouched.visible_quantity().as_u64(),
+            5,
+            "a base residual below one lot ends the walk, cheaper bid or not"
+        );
+    }
+
     /// Lot rounding produces the same dust: with a lot of 5, a budget of
     /// 700 at 100 caps at 7, rounds to 5, fills the non-self lot, and the
     /// 200 left over cannot fund another whole lot. The maker is untouched
