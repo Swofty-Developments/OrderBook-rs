@@ -115,6 +115,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reachable maker still yields `SelfTradePrevented` with the true non-self
   fill.
 
+  The same walk had a second, older bug the reachability guards exposed:
+  a zero per-level cap ended the whole sweep, which is right for a
+  base-quantity budget (the cap is the lot-rounded residual and ignores
+  the level price) and for a quote-notional buy (asks ascend, so
+  `remaining / price` only shrinks), but wrong for a quote-notional sell,
+  whose walk descends the bids so that a budget too small here can still
+  fund a whole lot lower down. A sell of 150 into bids 100, 75 and 50
+  executed one unit instead of two. The direction-aware decision now
+  lives in `StopCondition::zero_cap_is_terminal`, and the walk skips the
+  level instead of breaking when a notional sell can still reach cheaper
+  bids; a small notional sell budget may therefore visit every remaining
+  bid level, bounded by the level count the sweep would traverse anyway.
+
 - **A reserve residual follows `auto_replenish` (#230).**
   `reduce_reserve_to_total` — the residual-resting helper behind
   `OrderQuantity::set_total_remaining`, which `add_order` uses to distribute
