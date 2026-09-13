@@ -262,22 +262,37 @@ impl StopCondition {
     /// - `QuoteAmount` on a sell: the walk moves to cheaper bids, so
     ///   `remaining / level_price` can rise again. A budget that cannot fund
     ///   one lot at this bid may fund a whole one at a lower bid, so the
-    ///   level is skipped and the walk continues.
+    ///   level is skipped and the walk continues — unless the budget cannot
+    ///   fund a lot at **any** price, which is the exact test below.
     ///
-    /// Consequence of the sell arm: a small notional budget can now visit
-    /// every remaining bid level before the sweep ends, instead of stopping
-    /// at the first unaffordable one. That is the price of filling what the
-    /// budget can actually afford, and it is bounded by the level count the
-    /// sweep would traverse anyway.
+    /// The sell arm's exact terminal condition is `remaining < lot`. The cap
+    /// is `(remaining / level_price)` rounded down to a multiple of `lot`,
+    /// and the cheapest a level can be is a price of `1`, at which the cap is
+    /// `remaining` itself; no level can yield more. So `remaining < lot`
+    /// means every level still ahead caps at zero and the walk is over,
+    /// while `remaining >= lot` means some reachable price would fund a lot
+    /// and the walk must go on to find out whether the book offers one.
+    /// With no lot size configured (`lot <= 1`) that reduces to
+    /// `remaining == 0`, which the loop's own `is_done` check already
+    /// handles, so a notional sell then stops only on an exhausted budget or
+    /// an exhausted side.
+    ///
+    /// Traversal cost: a notional sell whose budget stays at or above one
+    /// lot visits every remaining level on its side, which is strictly more
+    /// than the old unconditional break did. The bound is the number of
+    /// levels resting on that side; each skipped level costs one `u128`
+    /// divide and no level mutation.
     ///
     /// Only ever consulted when the cap is already zero, so the base-qty
     /// hot path (`lot <= 1`, cap equal to the residual) never evaluates it.
     #[inline]
     #[must_use]
-    fn zero_cap_is_terminal(&self, taker_side: Side) -> bool {
+    fn zero_cap_is_terminal(&self, taker_side: Side, lot: u64) -> bool {
         match self {
             Self::BaseQty { .. } => true,
-            Self::QuoteAmount { .. } => matches!(taker_side, Side::Buy),
+            Self::QuoteAmount { remaining } => {
+                matches!(taker_side, Side::Buy) || *remaining < u128::from(lot.max(1))
+            }
         }
     }
 }
@@ -552,7 +567,7 @@ where
             // `StopCondition::zero_cap_is_terminal`.
             let qty_cap = stop.level_qty_cap(price, lot);
             if qty_cap == 0 {
-                if stop.zero_cap_is_terminal(side) {
+                if stop.zero_cap_is_terminal(side, lot) {
                     break;
                 }
                 continue;
@@ -1504,8 +1519,8 @@ mod stop_condition_tests {
         let stop = StopCondition::BaseQty { remaining: 5 };
         assert_eq!(stop.level_qty_cap(50, 100), 0);
         assert_eq!(stop.level_qty_cap(1, 100), 0);
-        assert!(stop.zero_cap_is_terminal(Side::Buy));
-        assert!(stop.zero_cap_is_terminal(Side::Sell));
+        assert!(stop.zero_cap_is_terminal(Side::Buy, 100));
+        assert!(stop.zero_cap_is_terminal(Side::Sell, 100));
     }
 
     #[test]
@@ -1515,7 +1530,7 @@ mod stop_condition_tests {
         let stop = StopCondition::QuoteAmount { remaining: 50 };
         assert_eq!(stop.level_qty_cap(100, 1), 0);
         assert_eq!(stop.level_qty_cap(200, 1), 0);
-        assert!(stop.zero_cap_is_terminal(Side::Buy));
+        assert!(stop.zero_cap_is_terminal(Side::Buy, 1));
     }
 
     #[test]
@@ -1526,7 +1541,7 @@ mod stop_condition_tests {
         let stop = StopCondition::QuoteAmount { remaining: 50 };
         assert_eq!(stop.level_qty_cap(75, 1), 0);
         assert_eq!(stop.level_qty_cap(50, 1), 1);
-        assert!(!stop.zero_cap_is_terminal(Side::Sell));
+        assert!(!stop.zero_cap_is_terminal(Side::Sell, 1));
     }
 
     #[test]
@@ -1538,7 +1553,40 @@ mod stop_condition_tests {
         let stop = StopCondition::QuoteAmount { remaining: 500 };
         assert_eq!(stop.level_qty_cap(200, 5), 0);
         assert_eq!(stop.level_qty_cap(100, 5), 5);
-        assert!(!stop.zero_cap_is_terminal(Side::Sell));
-        assert!(stop.zero_cap_is_terminal(Side::Buy));
+        assert!(!stop.zero_cap_is_terminal(Side::Sell, 5));
+        assert!(stop.zero_cap_is_terminal(Side::Buy, 5));
+    }
+
+    #[test]
+    fn test_quote_sell_terminal_boundary_is_remaining_below_one_lot() {
+        // The exact bound. The cheapest a level can be is a price of 1,
+        // where the cap is `remaining` itself rounded down to a lot, so a
+        // sell walk is over precisely when `remaining < lot`.
+        let lot = 5;
+        let below = StopCondition::QuoteAmount { remaining: 4 };
+        assert_eq!(below.level_qty_cap(1, lot), 0, "no price can fund a lot");
+        assert!(below.zero_cap_is_terminal(Side::Sell, lot));
+
+        let exactly_one_lot = StopCondition::QuoteAmount { remaining: 5 };
+        assert_eq!(
+            exactly_one_lot.level_qty_cap(1, lot),
+            5,
+            "a price of 1 funds exactly one lot"
+        );
+        assert!(!exactly_one_lot.zero_cap_is_terminal(Side::Sell, lot));
+    }
+
+    #[test]
+    fn test_quote_sell_without_lot_size_is_terminal_only_on_a_spent_budget() {
+        // `lot <= 1` collapses the bound to `remaining == 0`, which the
+        // loop's own `is_done` check reaches first, so a notional sell then
+        // stops only on an exhausted budget or an exhausted side.
+        let spent = StopCondition::QuoteAmount { remaining: 0 };
+        assert!(spent.zero_cap_is_terminal(Side::Sell, 1));
+        assert!(spent.zero_cap_is_terminal(Side::Sell, 0));
+
+        let one = StopCondition::QuoteAmount { remaining: 1 };
+        assert!(!one.zero_cap_is_terminal(Side::Sell, 1));
+        assert!(!one.zero_cap_is_terminal(Side::Sell, 0));
     }
 }

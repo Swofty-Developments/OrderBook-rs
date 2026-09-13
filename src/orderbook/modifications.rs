@@ -1505,6 +1505,16 @@ where
     /// deeper one — and the modify is admitted. A same-user maker resting
     /// at a crossed level is therefore not by itself a reason to reject.
     ///
+    /// How much that pre-match actually delivers is asked of
+    /// `PriceLevel::matchable_quantity`, the same authoritative dry run the
+    /// no-conflict arm uses, bounded by the non-self prefix. `safe_quantity`
+    /// is a sum of *visible* quantities and can overstate what the sweep
+    /// executes — a no-progress maker is set aside, and a replenish whose
+    /// checked net delta would overflow the level's visible counter aborts
+    /// the sweep untouched (#124) — and overstating it here would admit a
+    /// reprice the sweep then kills after the original was already
+    /// cancelled.
+    ///
     /// No-op when STP is off, the taker is anonymous, or the mode is
     /// [`CancelMaker`](crate::orderbook::stp::STPMode::CancelMaker) (which
     /// cancels the maker and rests the taker — it never destroys the re-added
@@ -1602,7 +1612,25 @@ where
                     // dust is), so any residual here is the engine's cancel
                     // verdict; a taker the non-self depth satisfies never
                     // reaches its own maker.
-                    remaining = remaining.saturating_sub(cap.min(safe_quantity));
+                    //
+                    // What the sweep subtracts is what `PriceLevel::match_order`
+                    // *executes*, not the depth `check_stp_at_level` counted:
+                    // `safe_quantity` sums the **visible** quantity of the
+                    // makers ahead, and a maker can be counted there and still
+                    // deliver less — a maker that makes no progress is set
+                    // aside, and a replenish whose checked net delta would
+                    // overflow the level's visible counter aborts the sweep
+                    // with that maker untouched (#124 / PriceLevel#130). Taking
+                    // `safe_quantity` at face value would admit a reprice the
+                    // sweep then kills, which is precisely the destruction
+                    // #168 exists to prevent, so the pre-match is bounded by
+                    // the same authoritative dry run the `NoConflict` arm uses.
+                    // Capping its request at `cap.min(safe_quantity)` keeps it
+                    // inside the non-self prefix, so it never counts depth
+                    // behind the same-user maker.
+                    remaining = remaining.saturating_sub(
+                        level.matchable_quantity(cap.min(safe_quantity), new_order.id()),
+                    );
                     if remaining > 0 {
                         return Err(OrderBookError::SelfTradePrevented {
                             mode: self.stp_mode,

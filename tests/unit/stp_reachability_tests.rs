@@ -9,7 +9,14 @@
 //! residual keeps the STP verdict whatever its size, since walked past it
 //! would rest crossed against the taker's own maker.
 //! `check_modify_stp_self_cross` applies the same per-level FIFO rule and
-//! the same lot-rounded per-level cap on the modify path.
+//! the same lot-rounded per-level cap on the modify path, and sizes its
+//! pre-match with `PriceLevel::matchable_quantity` rather than the counted
+//! visible depth, so a maker that is counted yet delivers nothing cannot
+//! make it admit a reprice the sweep would kill.
+//!
+//! Scope: `STPMode::CancelTaker` and `STPMode::CancelBoth`.
+//! `STPMode::CancelMaker` is not reachability-gated and still cancels every
+//! same-user order at a level the sweep touches.
 
 #[cfg(test)]
 mod tests_stp_reachability {
@@ -1063,6 +1070,152 @@ mod tests_stp_reachability {
                 state(&repriced),
                 state(&direct),
                 "{mode}: the repriced book and the directly-submitted book agree"
+            );
+        }
+    }
+
+    /// The precheck must measure the pre-match by what the sweep would
+    /// execute, not by the visible depth `check_stp_at_level` counted. A
+    /// maker queued ahead of the same-user maker can be counted in
+    /// `safe_quantity` and still deliver nothing, in which case the taker
+    /// reaches its own maker and the sweep cancels it. Taking the count at
+    /// face value admitted the reprice, cancelled the original, and let the
+    /// re-add be killed — the destruction `check_modify_stp_self_cross`
+    /// exists to prevent.
+    ///
+    /// The state used here is the #124 replenish-headroom abort. Asks at
+    /// 100, in insertion order:
+    /// - a reserve from another user showing 10, hidden 100, replenishing
+    ///   by 90 once its visible tranche falls to the threshold;
+    /// - a plain maker from another user showing `u64::MAX - 15`, which
+    ///   brings the level's visible counter to exactly `u64::MAX`;
+    /// - the taker's own maker, showing 5.
+    ///
+    /// The taker rests a bid of 10 at 90 and reprices it to 100.
+    /// `check_stp_at_level` counts `safe_quantity` = 10 + (`u64::MAX` - 15)
+    /// = `u64::MAX` - 5, far above the taker's 10. But the sweep's very
+    /// first maker is the reserve: consuming its 10 triggers a replenish of
+    /// 90, whose checked net delta would take the level's visible counter
+    /// past `u64::MAX`, so the maker is set aside untouched and the sweep
+    /// ends having executed nothing. The taker keeps all 10, reaches its own
+    /// maker, and is cancelled.
+    ///
+    /// Expected: the reprice is refused with `SelfTradePrevented` and the
+    /// original bid still rests at 90 with its 10, the reserve still shows
+    /// 10, and the same-user ask still shows 5. The direct submit of the
+    /// same order is refused too and executes nothing, which is what the
+    /// precheck now agrees with.
+    #[test]
+    fn precheck_refuses_when_a_maker_ahead_cannot_deliver_its_counted_depth() {
+        const RESERVE: u64 = 51;
+        const HUGE: u64 = 52;
+        const SELF_ASK: u64 = 53;
+
+        for mode in [STPMode::CancelTaker, STPMode::CancelBoth] {
+            let build = || {
+                let mut book: OrderBook<()> = DefaultOrderBook::new("STPH");
+                book.set_stp_mode(mode);
+                book.set_order_state_tracker(OrderStateTracker::new());
+                book.add_order(OrderType::ReserveOrder {
+                    id: Id::from_u64(RESERVE),
+                    price: Price::new(PRICE),
+                    visible_quantity: Quantity::new(10),
+                    hidden_quantity: Quantity::new(100),
+                    side: Side::Sell,
+                    user_id: user(2),
+                    timestamp: TimestampMs::new(0),
+                    time_in_force: TimeInForce::Gtc,
+                    replenish_threshold: Quantity::new(5),
+                    replenish_amount: NonZeroU64::new(90),
+                    auto_replenish: true,
+                    extra_fields: (),
+                })
+                .expect("seed the replenishing reserve at the front");
+                book.add_limit_order_with_user(
+                    Id::from_u64(HUGE),
+                    PRICE,
+                    u64::MAX - 15,
+                    Side::Sell,
+                    TimeInForce::Gtc,
+                    user(2),
+                    None,
+                )
+                .expect("seed the maker that fills the level's visible headroom");
+                book.add_limit_order_with_user(
+                    Id::from_u64(SELF_ASK),
+                    PRICE,
+                    5,
+                    Side::Sell,
+                    TimeInForce::Gtc,
+                    user(1),
+                    None,
+                )
+                .expect("seed the same-user maker behind them");
+                book
+            };
+
+            // The sweep's verdict on the same order, submitted directly.
+            let direct = build();
+            let via_add = direct.add_limit_order_with_user(
+                Id::from_u64(TAKER),
+                PRICE,
+                10,
+                Side::Buy,
+                TimeInForce::Gtc,
+                user(1),
+                None,
+            );
+            assert!(
+                matches!(via_add, Err(OrderBookError::SelfTradePrevented { .. })),
+                "{mode}: the aborted sweep executes nothing, so the taker reaches its own maker: {via_add:?}"
+            );
+
+            // The precheck's verdict on the same order, reached by reprice.
+            let repriced = build();
+            repriced
+                .add_limit_order_with_user(
+                    Id::from_u64(TAKER),
+                    90,
+                    10,
+                    Side::Buy,
+                    TimeInForce::Gtc,
+                    user(1),
+                    None,
+                )
+                .expect("rest the bid below the market");
+            let via_modify = repriced.update_order(OrderUpdate::UpdatePrice {
+                order_id: Id::from_u64(TAKER),
+                new_price: Price::new(PRICE),
+            });
+            assert!(
+                matches!(via_modify, Err(OrderBookError::SelfTradePrevented { .. })),
+                "{mode}: the precheck must reach the sweep's verdict: {via_modify:?}"
+            );
+
+            let original = repriced
+                .get_order(Id::from_u64(TAKER))
+                .unwrap_or_else(|| panic!("{mode}: the original survives a refused reprice"));
+            assert_eq!(
+                (
+                    original.price().as_u128(),
+                    original.visible_quantity().as_u64()
+                ),
+                (90, 10),
+                "{mode}: refused before the cancel, so the original is unchanged"
+            );
+            assert_eq!(
+                repriced
+                    .get_order(Id::from_u64(RESERVE))
+                    .map(|o| o.visible_quantity().as_u64()),
+                Some(10),
+                "{mode}: the aborted maker is set aside untouched"
+            );
+            assert_eq!(
+                repriced
+                    .get_order(Id::from_u64(SELF_ASK))
+                    .map(|o| o.visible_quantity().as_u64()),
+                Some(5),
+                "{mode}: a refused reprice never touches the same-user maker"
             );
         }
     }
