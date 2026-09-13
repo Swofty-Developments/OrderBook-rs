@@ -75,6 +75,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`STPMode::CancelTaker` and `STPMode::CancelBoth` fire only on a
+  same-user maker the taker can reach (#222).** Scope: those two modes.
+  `STPMode::CancelMaker` is deliberately unchanged and still cancels every
+  same-user order at a level the sweep touches, reachable or not — it never
+  destroys the taker, so the gate would only change which resting orders
+  survive. `check_stp_at_level` reports a conflict whenever a
+  same-user maker rests at a crossed level, and the `CancelTaker` /
+  `CancelBoth` arms then cancelled the taker (and, under `CancelBoth`, the
+  maker) unconditionally after their safe-quantity pre-match. A taker the
+  non-self depth ahead of that maker already satisfied therefore returned
+  `SelfTradePrevented` with `Cancelled { filled_quantity: n }` — a client
+  that retried double-filled — and `CancelBoth` destroyed a maker the
+  sweep never touched; market takers reach the same arms through
+  `match_order_with_user`, which drops the taker flag, so the caller saw
+  `Ok` while the maker was gone. The arms now cancel only when the sweep
+  can still execute into the same-user maker, with two guards: a budget
+  the pre-match exhausted (`is_done()`) is an ordinary complete fill, and
+  quote-notional dust — a residual that cannot fund one more lot at the
+  level's price, the usual end of a notional sweep since the budget rarely
+  lands on exactly zero, and the lot-rounded case — leaves the maker
+  untouched and walks on to the next level instead of breaking, because a
+  quote-amount sell can still afford a whole lot at a cheaper bid further
+  down. A base-quantity residual keeps the STP verdict whatever its size:
+  a maker admitted before a lot-size change keeps resting with a
+  misaligned tranche (documented on `set_lot_size`), so a sub-lot
+  residual is reachable, and walked past it would rest crossed against
+  the taker's own maker. The modify precheck
+  `check_modify_stp_self_cross` (#168) rejected a reprice as soon as any
+  same-user order rested at a crossed level, before subtracting the
+  non-self depth queued ahead of it; it now mirrors the sweep's
+  lot-rounded per-level cap and consults the same insertion-sequence
+  `check_stp_at_level` verdict, so a reprice the non-self depth covers is
+  admitted, one it does not cover is still refused before the original is
+  cancelled, and dust the sweep stops on before a deeper same-user level
+  is admitted exactly as a direct submit is. The pre-match is sized by
+  `PriceLevel::matchable_quantity` — the authoritative dry run the
+  no-conflict arm already used — bounded by the non-self prefix, not by
+  `safe_quantity` itself. That sum counts *visible* quantity and can
+  overstate what the sweep executes (a no-progress maker is set aside; a
+  replenish whose checked net delta would overflow the level's visible
+  counter aborts the sweep untouched, #124), and overstating it admitted a
+  reprice the sweep then killed after the original was already cancelled —
+  the destruction #168 exists to prevent. Pinned for base-quantity,
+  fill-or-kill and market takers, quote-amount buys (dust and reachable),
+  a quote-amount sell past an unaffordable self level, a lot-rounded
+  notional residual, a sub-lot reserve tranche resting from before a
+  lot-size change (sweep and reprice),
+  precheck/sweep agreement on dust before a deeper self level, the
+  exact-depth boundary, a maker ahead that is counted in `safe_quantity`
+  yet delivers nothing (the #124 replenish-headroom abort, where the
+  reprice is now refused with the original left resting), and same-level
+  reprices (admitted and refused); a
+  reachable maker still yields `SelfTradePrevented` with the true non-self
+  fill. The notional-sell walk is pinned on a plain STP-off book too, since
+  the walk direction and not the STP mode decides the zero-cap verdict.
+
+  The same walk had a second, older bug the reachability guards exposed:
+  a zero per-level cap ended the whole sweep, which is right for a
+  base-quantity budget (the cap is the lot-rounded residual and ignores
+  the level price) and for a quote-notional buy (asks ascend, so
+  `remaining / price` only shrinks), but wrong for a quote-notional sell,
+  whose walk descends the bids so that a budget too small here can still
+  fund a whole lot lower down. A sell of 150 into bids 100, 75 and 50
+  executed one unit instead of two. The direction-aware decision now
+  lives in `StopCondition::zero_cap_is_terminal`, and the walk skips the
+  level instead of breaking when a notional sell can still reach cheaper
+  bids. Its exact terminal condition is `remaining < lot`: the cheapest a
+  level can be is a price of 1, where the cap is the whole remaining
+  notional, so below one lot no level still ahead can execute. With no lot
+  size configured that reduces to a spent budget, which the loop's own
+  completion check reaches first, so a notional sell then ends only on a
+  spent budget or an exhausted side and visits every level on that side.
+  Each skipped level costs one `u128` division and mutates nothing.
+
 - **A reserve residual follows `auto_replenish` (#230).**
   `reduce_reserve_to_total` — the residual-resting helper behind
   `OrderQuantity::set_total_remaining`, which `add_order` uses to distribute

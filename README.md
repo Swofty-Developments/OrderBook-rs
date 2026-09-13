@@ -174,6 +174,33 @@ This order book engine is built with the following design principles:
   sets the **visible** tranche and leaves hidden untouched for both
   two-tranche kinds, matching `UpdateQuantity`, `Replace` and the upstream
   `pricelevel` contract.
+- **`CancelTaker` and `CancelBoth` fire only on a same-user maker the
+  taker can reach (#222).** Both arms used to cancel unconditionally once
+  a same-user maker rested at a crossed level, even when the non-self
+  depth queued ahead of it already satisfied the taker. A client saw
+  `SelfTradePrevented` on an order that had in fact filled, and
+  `CancelBoth` destroyed a maker the sweep never touched — silently on
+  the market paths, which drop the taker-cancelled flag and return `Ok`.
+  The arms now execute against the non-self depth first and cancel only
+  if the taker could still execute at that price afterwards.
+  `STPMode::CancelMaker` is deliberately unchanged: it still cancels every
+  same-user order at a level the sweep touches, since it never destroys
+  the taker. The modify pre-check `check_modify_stp_self_cross` follows
+  the same per-level rule and sizes the pre-match with `pricelevel`'s
+  authoritative dry run rather than the counted visible depth, so it
+  cannot admit a re-price the sweep would then kill after the original
+  was cancelled.
+- **A quote-notional sell walks past a bid it cannot afford (#222).** A
+  zero per-level quantity cap ended the whole sweep. That is right for a
+  base-quantity budget, whose cap ignores the level price, and for a
+  notional buy, which walks asks ascending so the cap only shrinks. It
+  was wrong for a notional sell, which walks bids descending: a budget
+  too small at one bid can fund a whole lot at a cheaper one. Selling 150
+  into bids of 100, 75 and 50 executed one unit instead of two. The sell
+  walk now skips the unaffordable level and stops only on a spent budget,
+  an exhausted side, or a remainder below one lot — the point at which no
+  price could fund a lot. It may therefore visit every level on the bid
+  side; each skipped level costs one division and mutates nothing.
 
 ### What's New in Version 0.12.0
 

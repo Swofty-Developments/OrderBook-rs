@@ -196,6 +196,104 @@ fn test_sell_symmetric_walk() {
     assert_eq!(result.executed_value().expect("executed value"), 3_030);
 }
 
+/// A sell walk steps over a bid it cannot afford and keeps descending,
+/// on a plain book with self-trade prevention left off (#222). The walk
+/// direction, not the STP mode, decides whether a zero per-level cap ends
+/// the sweep, so this path is shared by every book.
+///
+/// Bids 100, 75 and 50, one unit each; sell a quote amount of 150.
+/// Derivation, bids descending:
+/// - 100: cap = 150 / 100 = 1, one unit executes, budget 150 - 100 = 50.
+/// - 75: cap = 50 / 75 = 0. Nothing executes, but the bids still ahead are
+///   cheaper, so the level is skipped rather than ending the sweep.
+/// - 50: cap = 50 / 50 = 1, one unit executes, budget reaches 0.
+///
+/// Expected: 2 trades for 150 spent, at 100 and at 50, with the bid at 75
+/// left resting untouched. Before the fix this stopped at 75 with a single
+/// trade and 50 of the budget unspent.
+#[test]
+fn test_sell_skips_an_unaffordable_level_and_reaches_a_cheaper_bid() {
+    let book: OrderBook<()> = OrderBook::new("TEST");
+    let skipped = Id::new_uuid();
+    for (id, price) in [
+        (Id::new_uuid(), 100u128),
+        (skipped, 75),
+        (Id::new_uuid(), 50),
+    ] {
+        book.add_limit_order(id, price, 1, Side::Buy, TimeInForce::Gtc, None)
+            .expect("seed bid");
+    }
+
+    let result = book
+        .match_market_order_by_amount(Id::new_uuid(), 150, Side::Sell)
+        .expect("notional sell must succeed");
+
+    let trades = result.trades().as_vec();
+    assert_eq!(trades.len(), 2, "one trade at 100 and one at 50");
+    assert_eq!(trades[0].price().as_u128(), 100);
+    assert_eq!(trades[0].quantity().as_u64(), 1);
+    assert_eq!(trades[1].price().as_u128(), 50);
+    assert_eq!(trades[1].quantity().as_u64(), 1);
+    assert_eq!(result.executed_value().expect("executed value"), 150);
+    assert_eq!(
+        book.get_order(skipped)
+            .expect("the unaffordable bid at 75 is skipped, not consumed")
+            .visible_quantity()
+            .as_u64(),
+        1
+    );
+    assert_eq!(
+        book.best_bid(),
+        Some(75),
+        "only the skipped level is left on the bid side"
+    );
+}
+
+/// The lot-size bound on the same walk: once the remaining notional cannot
+/// fund one whole lot at a price of 1 — the cheapest level that could
+/// exist — no level still ahead can execute and the sweep ends (#222).
+///
+/// Lot 10, bids 100, 75 and 50 holding 10 units each; sell 1_100.
+/// Derivation, bids descending:
+/// - 100: cap = 1_100 / 100 = 11, rounded down to 10. Ten units execute
+///   and the budget falls to 1_100 - 1_000 = 100.
+/// - 75: cap = 100 / 75 = 1, rounded down to a lot of 10 gives 0. The
+///   budget of 100 is still at or above one lot, so the walk continues.
+/// - 50: cap = 100 / 50 = 2, rounded down to 0. Still at or above one lot,
+///   so the walk continues and then runs out of levels.
+///
+/// Expected: a single trade of 10 at 100 for 1_000 spent, with both
+/// cheaper bids left resting in full.
+#[test]
+fn test_sell_lot_rounding_leaves_cheaper_levels_untouched_when_no_lot_fits() {
+    let book: OrderBook<()> = OrderBook::with_lot_size("TEST", 10);
+    let at_75 = Id::new_uuid();
+    let at_50 = Id::new_uuid();
+    for (id, price) in [(Id::new_uuid(), 100u128), (at_75, 75), (at_50, 50)] {
+        book.add_limit_order(id, price, 10, Side::Buy, TimeInForce::Gtc, None)
+            .expect("seed bid");
+    }
+
+    let result = book
+        .match_market_order_by_amount(Id::new_uuid(), 1_100, Side::Sell)
+        .expect("notional sell must succeed");
+
+    let trades = result.trades().as_vec();
+    assert_eq!(trades.len(), 1, "no cheaper bid can fund a whole lot");
+    assert_eq!(trades[0].price().as_u128(), 100);
+    assert_eq!(trades[0].quantity().as_u64(), 10);
+    assert_eq!(result.executed_value().expect("executed value"), 1_000);
+    for id in [at_75, at_50] {
+        assert_eq!(
+            book.get_order(id)
+                .expect("cheaper bids still rest")
+                .visible_quantity()
+                .as_u64(),
+            10
+        );
+    }
+}
+
 #[test]
 fn test_sell_empty_book_errors_with_notional_variant() {
     let book: OrderBook<()> = OrderBook::new("TEST");

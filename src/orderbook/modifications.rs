@@ -1495,6 +1495,26 @@ where
     /// `stp_taker_cancelled`), returns [`OrderBookError::SelfTradePrevented`]
     /// **before** the original is cancelled, so it survives unchanged.
     ///
+    /// Reachability is decided per level exactly as the sweep decides it:
+    /// the level's orders are read in insertion-sequence (consumption)
+    /// order and handed to [`check_stp_at_level`], whose `safe_quantity` is
+    /// the non-self depth queued ahead of the first same-user maker. The
+    /// engine pre-matches up to that depth and only then cancels the
+    /// taker if quantity is still left, so a taker the non-self depth
+    /// satisfies never reaches its own maker — at that level or any
+    /// deeper one — and the modify is admitted. A same-user maker resting
+    /// at a crossed level is therefore not by itself a reason to reject.
+    ///
+    /// How much that pre-match actually delivers is asked of
+    /// `PriceLevel::matchable_quantity`, the same authoritative dry run the
+    /// no-conflict arm uses, bounded by the non-self prefix. `safe_quantity`
+    /// is a sum of *visible* quantities and can overstate what the sweep
+    /// executes — a no-progress maker is set aside, and a replenish whose
+    /// checked net delta would overflow the level's visible counter aborts
+    /// the sweep untouched (#124) — and overstating it here would admit a
+    /// reprice the sweep then kills after the original was already
+    /// cancelled.
+    ///
     /// No-op when STP is off, the taker is anonymous, or the mode is
     /// [`CancelMaker`](crate::orderbook::stp::STPMode::CancelMaker) (which
     /// cancels the maker and rests the taker — it never destroys the re-added
@@ -1506,7 +1526,7 @@ where
         &self,
         new_order: &OrderType<T>,
     ) -> Result<(), OrderBookError> {
-        use crate::orderbook::stp::STPMode;
+        use crate::orderbook::stp::{STPAction, STPMode, check_stp_at_level};
 
         let taker_user_id = new_order.user_id();
         // Only CancelTaker / CancelBoth cancel the taker; None / CancelMaker
@@ -1533,11 +1553,31 @@ where
             Side::Sell => Either::Right(opposite.iter().rev()),
         };
 
+        let lot = self.lot_size.unwrap_or(1);
         let mut remaining = new_order.total_quantity();
         for entry in iter {
-            if remaining == 0 {
-                // The taker fully fills against non-self depth before reaching
-                // any same-user maker → the engine never cancels it.
+            // Lot-round the remaining budget exactly like the sweep's
+            // `StopCondition::level_qty_cap`. A spent budget is a complete
+            // fill, and a residual below one lot is dust the sweep stops on
+            // before it scans another level (it rests, STP never consulted),
+            // so neither can reach a same-user maker → the engine never
+            // cancels the taker.
+            //
+            // Returning here — rather than skipping the level — also matches
+            // the sweep's `StopCondition::zero_cap_is_terminal`: a modify is
+            // always a base-quantity taker, and a base cap is the lot-rounded
+            // residual, independent of the level price. Zero here is zero at
+            // every level still ahead whichever way the walk runs, so there
+            // is no side asymmetry to mirror. Only the sweep's
+            // quote-notional sell arm keeps walking on a zero cap, because
+            // its per-level cap rises again as bids get cheaper, and no
+            // modify ever takes that arm.
+            let cap = if lot <= 1 {
+                remaining
+            } else {
+                remaining - (remaining % lot)
+            };
+            if cap == 0 {
                 return Ok(());
             }
             let price = *entry.key();
@@ -1550,20 +1590,60 @@ where
                 break;
             }
             let level = entry.value();
-            if level.iter_orders().any(|o| o.user_id() == taker_user_id) {
-                // The sweep reaches a level holding a same-user maker while the
-                // taker still has unfilled quantity: the engine would cancel the
-                // taker here. Reject the modify before the original is cancelled.
-                return Err(OrderBookError::SelfTradePrevented {
-                    mode: self.stp_mode,
-                    taker_order_id: new_order.id(),
-                    user_id: taker_user_id,
-                });
+            // Insertion-sequence order is the sweep's consumption order (#132),
+            // so `safe_quantity` below is exactly the non-self depth the engine
+            // pre-matches before it decides on the same-user maker.
+            let orders = level.snapshot_by_insertion_seq();
+            match check_stp_at_level(&orders, taker_user_id, self.stp_mode) {
+                STPAction::NoConflict => {
+                    // No same-user maker at this level: the taker consumes its
+                    // full matchable depth under the lot-rounded cap (the
+                    // authoritative upstream dry run), then walks on.
+                    remaining =
+                        remaining.saturating_sub(level.matchable_quantity(cap, new_order.id()));
+                }
+                STPAction::CancelTaker { safe_quantity }
+                | STPAction::CancelBoth { safe_quantity, .. } => {
+                    // The sweep pre-matches `min(cap, safe_quantity)` against
+                    // the non-self depth queued ahead of the same-user maker
+                    // and cancels the taker only if quantity is still left
+                    // after that. A modify is always base quantity, and a
+                    // base residual is never walked past (only quote-notional
+                    // dust is), so any residual here is the engine's cancel
+                    // verdict; a taker the non-self depth satisfies never
+                    // reaches its own maker.
+                    //
+                    // What the sweep subtracts is what `PriceLevel::match_order`
+                    // *executes*, not the depth `check_stp_at_level` counted:
+                    // `safe_quantity` sums the **visible** quantity of the
+                    // makers ahead, and a maker can be counted there and still
+                    // deliver less — a maker that makes no progress is set
+                    // aside, and a replenish whose checked net delta would
+                    // overflow the level's visible counter aborts the sweep
+                    // with that maker untouched (#124 / PriceLevel#130). Taking
+                    // `safe_quantity` at face value would admit a reprice the
+                    // sweep then kills, which is precisely the destruction
+                    // #168 exists to prevent, so the pre-match is bounded by
+                    // the same authoritative dry run the `NoConflict` arm uses.
+                    // Capping its request at `cap.min(safe_quantity)` keeps it
+                    // inside the non-self prefix, so it never counts depth
+                    // behind the same-user maker.
+                    remaining = remaining.saturating_sub(
+                        level.matchable_quantity(cap.min(safe_quantity), new_order.id()),
+                    );
+                    if remaining > 0 {
+                        return Err(OrderBookError::SelfTradePrevented {
+                            mode: self.stp_mode,
+                            taker_order_id: new_order.id(),
+                            user_id: taker_user_id,
+                        });
+                    }
+                    return Ok(());
+                }
+                // Unreachable: the mode filter above returned for CancelMaker,
+                // which cancels the maker and never the taker.
+                STPAction::CancelMaker => return Ok(()),
             }
-            // No same-user maker at this level: the taker consumes its full
-            // matchable depth (the authoritative upstream dry run), then walks on.
-            remaining =
-                remaining.saturating_sub(level.matchable_quantity(remaining, new_order.id()));
         }
         Ok(())
     }

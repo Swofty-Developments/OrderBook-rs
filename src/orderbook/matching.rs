@@ -225,6 +225,76 @@ impl StopCondition {
             Self::QuoteAmount { remaining } => *remaining == 0,
         }
     }
+
+    /// Whether the remaining budget is quote-notional dust at `level_price`:
+    /// nonzero, but unable to fund one more lot at that price.
+    ///
+    /// Only the notional arm is walked past on the STP-cancelling paths. A
+    /// base-quantity residual, whatever its size, is the taker's own
+    /// quantity still unfilled at a level holding its own maker; walked
+    /// past, it would rest crossed against that maker (a maker admitted
+    /// before a lot-size change keeps resting with a misaligned tranche —
+    /// see `set_lot_size` — so a sub-lot residual is reachable), so the
+    /// base arm keeps the STP verdict. A
+    /// notional taker never rests, and its dust at one price can still
+    /// fund a whole lot at a cheaper level, so it walks on instead.
+    #[inline]
+    #[must_use]
+    fn is_dust_at(&self, level_price: u128, lot: u64) -> bool {
+        matches!(self, Self::QuoteAmount { .. }) && self.level_qty_cap(level_price, lot) == 0
+    }
+
+    /// Whether a zero [`Self::level_qty_cap`] at the level the walk is
+    /// standing on ends the whole walk, or only this level.
+    ///
+    /// The taker's side fixes the walk direction and therefore the price
+    /// monotonicity of the levels still ahead: a buy taker walks asks
+    /// ascending, so every later level is **dearer**; a sell taker walks
+    /// bids descending, so every later level is **cheaper**.
+    ///
+    /// - `BaseQty`: the cap is the lot-rounded residual and does not depend
+    ///   on the level price at all. Zero here is zero at every remaining
+    ///   level whichever way the walk runs, so it is terminal on both sides.
+    /// - `QuoteAmount` on a buy: the cap is `remaining / level_price`, which
+    ///   is non-increasing as the walk moves to dearer asks. A budget that
+    ///   cannot fund one lot here funds even less further on, so zero is
+    ///   terminal.
+    /// - `QuoteAmount` on a sell: the walk moves to cheaper bids, so
+    ///   `remaining / level_price` can rise again. A budget that cannot fund
+    ///   one lot at this bid may fund a whole one at a lower bid, so the
+    ///   level is skipped and the walk continues — unless the budget cannot
+    ///   fund a lot at **any** price, which is the exact test below.
+    ///
+    /// The sell arm's exact terminal condition is `remaining < lot`. The cap
+    /// is `(remaining / level_price)` rounded down to a multiple of `lot`,
+    /// and the cheapest a level can be is a price of `1`, at which the cap is
+    /// `remaining` itself; no level can yield more. So `remaining < lot`
+    /// means every level still ahead caps at zero and the walk is over,
+    /// while `remaining >= lot` means some reachable price would fund a lot
+    /// and the walk must go on to find out whether the book offers one.
+    /// With no lot size configured (`lot <= 1`) that reduces to
+    /// `remaining == 0`, which the loop's own `is_done` check already
+    /// handles, so a notional sell then stops only on an exhausted budget or
+    /// an exhausted side.
+    ///
+    /// Traversal cost: a notional sell whose budget stays at or above one
+    /// lot visits every remaining level on its side, which is strictly more
+    /// than the old unconditional break did. The bound is the number of
+    /// levels resting on that side; each skipped level costs one `u128`
+    /// divide and no level mutation.
+    ///
+    /// Only ever consulted when the cap is already zero, so the base-qty
+    /// hot path (`lot <= 1`, cap equal to the residual) never evaluates it.
+    #[inline]
+    #[must_use]
+    fn zero_cap_is_terminal(&self, taker_side: Side, lot: u64) -> bool {
+        match self {
+            Self::BaseQty { .. } => true,
+            Self::QuoteAmount { remaining } => {
+                matches!(taker_side, Side::Buy) || *remaining < u128::from(lot.max(1))
+            }
+        }
+    }
 }
 
 impl<T> OrderBook<T>
@@ -490,10 +560,17 @@ where
 
             // Compute per-level base-qty cap respecting both the budget
             // (base-qty or notional) and `lot_size`. A zero cap means
-            // dust-below-lot at the current price ⇒ stop walking.
+            // dust-below-lot at the current price: nothing can execute
+            // *here*. Whether that also ends the walk depends on the
+            // direction it runs in — a notional sell keeps descending to
+            // cheaper bids, everything else stops. See
+            // `StopCondition::zero_cap_is_terminal`.
             let qty_cap = stop.level_qty_cap(price, lot);
             if qty_cap == 0 {
-                break;
+                if stop.zero_cap_is_terminal(side, lot) {
+                    break;
+                }
+                continue;
             }
 
             // Get price level value from the entry
@@ -607,6 +684,30 @@ where
                                 stop.consume(executed, price);
                             }
                         }
+                        // Reachability: the same-user maker is only reached
+                        // if the taker can still execute at this price after
+                        // the non-self depth in front of it. A budget the
+                        // pre-match exhausted is an ordinary complete fill.
+                        // Quote-notional dust — a residual that cannot fund
+                        // one more unit at this price, the usual end of a
+                        // notional sweep since `is_done()` is exact zero —
+                        // cannot execute here either, so the maker is
+                        // unreachable and survives, and the sweep walks on
+                        // rather than breaking: a notional sell can still
+                        // afford a whole lot at a cheaper bid (for a buy the
+                        // next ask is dearer and the loop's own cap check
+                        // ends the sweep). A base-quantity residual keeps
+                        // the STP verdict whatever its size: walked past, it
+                        // would rest crossed against the same-user maker
+                        // (see `StopCondition::is_dust_at`).
+                        // `check_modify_stp_self_cross` dry-runs the same
+                        // decision on the modify path (#168).
+                        if stop.is_done() {
+                            break;
+                        }
+                        if stop.is_dust_at(price, lot) {
+                            continue;
+                        }
                         stp_taker_cancelled = true;
                         break;
                     }
@@ -683,6 +784,18 @@ where
                                 );
                                 stop.consume(executed, price);
                             }
+                        }
+                        // Same reachability rule as `CancelTaker` above, and
+                        // here it also gates the maker cancellation: a maker
+                        // the taker never reached must survive untouched,
+                        // whether the budget is spent or only quote-notional
+                        // dust is left at this price. A base-quantity
+                        // residual still cancels both.
+                        if stop.is_done() {
+                            break;
+                        }
+                        if stop.is_dust_at(price, lot) {
+                            continue;
                         }
                         // Cancel the maker on the held level for the same lockstep
                         // event + state + risk effects as CancelMaker (#95); level
@@ -1397,5 +1510,83 @@ mod stop_condition_tests {
     fn test_is_done_quote_amount() {
         assert!(StopCondition::QuoteAmount { remaining: 0 }.is_done());
         assert!(!StopCondition::QuoteAmount { remaining: 1 }.is_done());
+    }
+
+    #[test]
+    fn test_zero_cap_is_terminal_for_base_qty_on_both_sides() {
+        // The base cap is the lot-rounded residual and ignores the level
+        // price, so a zero cap stays zero whichever way the walk runs.
+        let stop = StopCondition::BaseQty { remaining: 5 };
+        assert_eq!(stop.level_qty_cap(50, 100), 0);
+        assert_eq!(stop.level_qty_cap(1, 100), 0);
+        assert!(stop.zero_cap_is_terminal(Side::Buy, 100));
+        assert!(stop.zero_cap_is_terminal(Side::Sell, 100));
+    }
+
+    #[test]
+    fn test_zero_cap_is_terminal_for_quote_amount_on_a_buy() {
+        // Buy walks asks ascending: 50 cannot fund a unit at 100 and funds
+        // even less at the dearer 200 the walk would visit next.
+        let stop = StopCondition::QuoteAmount { remaining: 50 };
+        assert_eq!(stop.level_qty_cap(100, 1), 0);
+        assert_eq!(stop.level_qty_cap(200, 1), 0);
+        assert!(stop.zero_cap_is_terminal(Side::Buy, 1));
+    }
+
+    #[test]
+    fn test_zero_cap_is_not_terminal_for_quote_amount_on_a_sell() {
+        // Sell walks bids descending: 50 cannot fund a unit at 75 but funds
+        // exactly one at the cheaper 50 the walk would visit next, so the
+        // unaffordable level must be skipped rather than end the walk.
+        let stop = StopCondition::QuoteAmount { remaining: 50 };
+        assert_eq!(stop.level_qty_cap(75, 1), 0);
+        assert_eq!(stop.level_qty_cap(50, 1), 1);
+        assert!(!stop.zero_cap_is_terminal(Side::Sell, 1));
+    }
+
+    #[test]
+    fn test_zero_cap_is_not_terminal_for_a_lot_rounded_quote_sell() {
+        // Same rule under lot rounding: 500 caps at 500/75 = 6, rounded
+        // down to a lot of 5 that is still 5 — affordable. Push the price
+        // to 200 and the cap is 2, which rounds to 0; at the cheaper 100
+        // it is 5 again, so the walk must go on.
+        let stop = StopCondition::QuoteAmount { remaining: 500 };
+        assert_eq!(stop.level_qty_cap(200, 5), 0);
+        assert_eq!(stop.level_qty_cap(100, 5), 5);
+        assert!(!stop.zero_cap_is_terminal(Side::Sell, 5));
+        assert!(stop.zero_cap_is_terminal(Side::Buy, 5));
+    }
+
+    #[test]
+    fn test_quote_sell_terminal_boundary_is_remaining_below_one_lot() {
+        // The exact bound. The cheapest a level can be is a price of 1,
+        // where the cap is `remaining` itself rounded down to a lot, so a
+        // sell walk is over precisely when `remaining < lot`.
+        let lot = 5;
+        let below = StopCondition::QuoteAmount { remaining: 4 };
+        assert_eq!(below.level_qty_cap(1, lot), 0, "no price can fund a lot");
+        assert!(below.zero_cap_is_terminal(Side::Sell, lot));
+
+        let exactly_one_lot = StopCondition::QuoteAmount { remaining: 5 };
+        assert_eq!(
+            exactly_one_lot.level_qty_cap(1, lot),
+            5,
+            "a price of 1 funds exactly one lot"
+        );
+        assert!(!exactly_one_lot.zero_cap_is_terminal(Side::Sell, lot));
+    }
+
+    #[test]
+    fn test_quote_sell_without_lot_size_is_terminal_only_on_a_spent_budget() {
+        // `lot <= 1` collapses the bound to `remaining == 0`, which the
+        // loop's own `is_done` check reaches first, so a notional sell then
+        // stops only on an exhausted budget or an exhausted side.
+        let spent = StopCondition::QuoteAmount { remaining: 0 };
+        assert!(spent.zero_cap_is_terminal(Side::Sell, 1));
+        assert!(spent.zero_cap_is_terminal(Side::Sell, 0));
+
+        let one = StopCondition::QuoteAmount { remaining: 1 };
+        assert!(!one.zero_cap_is_terminal(Side::Sell, 1));
+        assert!(!one.zero_cap_is_terminal(Side::Sell, 0));
     }
 }

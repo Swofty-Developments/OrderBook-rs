@@ -11,6 +11,14 @@
 //! - `STPMode::CancelMaker` — Cancel the resting (maker) order and continue matching.
 //! - `STPMode::CancelBoth` — Cancel both taker and maker orders.
 //!
+//! # Reachability
+//!
+//! `CancelTaker` and `CancelBoth` fire only when the sweep can still
+//! execute into the same-user maker after the non-self depth queued ahead
+//! of it; `CancelMaker` cancels every same-user order at a level the sweep
+//! touches. See [`STPMode`](crate::orderbook::stp::STPMode) for the full
+//! rule and its known asymmetry.
+//!
 //! # Bypass
 //!
 //! Orders with `user_id == Hash32::zero()` (anonymous) always bypass STP checks,
@@ -26,6 +34,44 @@ use serde::{Deserialize, Serialize};
 ///
 /// The default mode is [`STPMode::None`], which disables all STP checks and
 /// incurs zero overhead in the matching hot path.
+///
+/// # Reachability
+///
+/// Introduced in #222. A same-user maker resting at a crossed level is not
+/// by itself a self-trade. Under [`CancelTaker`](Self::CancelTaker) and
+/// [`CancelBoth`](Self::CancelBoth) the engine first executes the taker
+/// against the non-self depth queued ahead of that maker, and only cancels
+/// if the taker could still execute at that price afterwards. So a taker the
+/// depth in front already satisfies fills normally, and under `CancelBoth`
+/// the maker it never reached keeps resting.
+///
+/// [`CancelMaker`](Self::CancelMaker) is deliberately **not** gated this
+/// way: it cancels every same-user order at a level the sweep touches,
+/// whether or not the taker could have executed into it. Cancelling the
+/// maker is that mode's whole purpose and it never destroys the taker, so
+/// the gate would only change which resting orders survive.
+///
+/// ## A known asymmetry in what counts as reachable
+///
+/// A residual too small to execute is treated differently depending on
+/// where the walk is standing when it appears, and the two cases are worth
+/// stating because they look alike from outside:
+///
+/// - A sub-lot residual left over **at the conflicting level** keeps the
+///   self-trade verdict and cancels the taker. It is the taker's own
+///   unfilled quantity sitting at a level that holds its own maker, and a
+///   maker admitted before a [`lot_size`](crate::OrderBook::set_lot_size)
+///   change keeps resting with a misaligned tranche, so that residual can
+///   still be reachable depth.
+/// - The identical residual arising **one level before** a deeper level
+///   holding the same user's maker rests crossed against that maker
+///   instead. The matching loop's zero-cap check runs at the top of each
+///   level, before the self-trade scan, so the walk stops without ever
+///   looking at the deeper level.
+///
+/// The modify precheck mirrors the loop, so a reprice and a direct submit
+/// of the same order reach the same verdict in both cases. The asymmetry is
+/// in the engine's definition of reachable, not between the two paths.
 ///
 /// # Concurrency (#225)
 ///
@@ -99,16 +145,36 @@ pub enum STPMode {
     /// Cancel the incoming (taker) order when a self-trade would occur.
     /// Resting orders remain in the book. Partial fills against different
     /// users that precede the self-trade are kept.
+    ///
+    /// "Would occur" means the sweep can still execute into the same-user
+    /// maker after consuming the non-self depth queued ahead of it at that
+    /// level. A taker that the depth in front already satisfies never
+    /// reaches its own maker, so it fills normally and no cancellation is
+    /// reported; so does a quote-notional taker whose remaining budget
+    /// cannot fund another lot at that level's price. See the
+    /// [reachability](Self#reachability) note.
     CancelTaker = 1,
 
     /// Cancel the resting (maker) order(s) from the same user and continue
     /// matching the taker against remaining orders. All same-user resting
     /// orders at each price level are removed before matching proceeds.
+    ///
+    /// This mode is **not** reachability-gated: every same-user order at a
+    /// level the sweep touches is cancelled, including one resting behind
+    /// more non-self depth than the taker can consume. The gate applies to
+    /// [`CancelTaker`](Self::CancelTaker) and
+    /// [`CancelBoth`](Self::CancelBoth) only. See the
+    /// [reachability](Self#reachability) note.
     CancelMaker = 2,
 
     /// Cancel both the incoming (taker) and the resting (maker) order.
     /// Matching stops immediately. Partial fills against different users
     /// that precede the self-trade are kept.
+    ///
+    /// Gated on reachability exactly as [`CancelTaker`](Self::CancelTaker)
+    /// is, and here the gate also protects the maker: one the sweep could
+    /// not have executed into survives untouched rather than being
+    /// cancelled. See the [reachability](Self#reachability) note.
     CancelBoth = 3,
 }
 
