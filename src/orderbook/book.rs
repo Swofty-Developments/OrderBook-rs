@@ -24,7 +24,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tracing::trace;
 use uuid::Uuid;
 
@@ -97,6 +97,59 @@ pub struct OrderBook<T = ()> {
     /// Flag indicating if there was a trade
     pub(super) has_traded: AtomicBool,
 
+    /// How many `ReserveOrder { auto_replenish: false, .. }` makers carrying
+    /// hidden quantity are resting on this book (#230).
+    ///
+    /// Gates the pre-match scan that captures makers whose hidden depth a
+    /// sweep would strand: at zero the scan can never report anything, and
+    /// skipping it keeps the sweep off `PriceLevel::iter_orders`, whose
+    /// `DashMap` iterator read-locks every shard per level match.
+    /// `match_order_inner` reads this once per sweep and, when it is zero,
+    /// allocates no capture buffer and runs no per-level capture at all.
+    ///
+    /// # Why the count is exact
+    ///
+    /// Not "an error would be harmless": the count is exact, and each side
+    /// of it has a reason.
+    ///
+    /// **Increments** sit at the only two places an order is ever rested:
+    /// the level insertion in `add_order_inner` and the snapshot-restore
+    /// commit. A strandable maker cannot reach a level without passing one
+    /// of them, so the count can never under-count.
+    ///
+    /// **Decrements** sit at the only three places such a maker leaves a
+    /// level, and each decides from the removed order's **own body**, never
+    /// from a cached id: `cancel_order_with_reason` (the funnel for user
+    /// cancels, the three cancel-then-add modifies, the scoped mass cancels
+    /// and expiry eviction) and `cancel_resting_maker_on_level` (the
+    /// self-trade-prevention maker cancel) both hold the cancelled
+    /// `OrderType`; the fill drain in `match_order_inner` decides from that
+    /// sweep's own capture list. `cancel_all_orders` empties the book in
+    /// bulk without that funnel and resets the count to zero instead.
+    ///
+    /// The fill drain is exact because of the gate rule in
+    /// [`acquire_coherent_submit_gate`](Self::acquire_coherent_submit_gate):
+    /// a sweep in a book holding strandable makers runs **exclusively**, so
+    /// no cancel, admission or id reuse can interleave between a level's
+    /// capture and its match. The capture therefore still describes the
+    /// orders the match consumes, and an id in both the capture list and
+    /// `filled_orders` is the same order in both — not a `Standard` order
+    /// that reused a cancelled reserve's id.
+    ///
+    /// The saturating decrement is defence in depth against a future path
+    /// that removes a maker without passing one of the three, not a licence
+    /// to be approximate.
+    ///
+    /// Not part of the snapshot format: the restore commit resets it to
+    /// zero with the rest of the book state and recounts from the orders it
+    /// installs.
+    ///
+    /// Coherence with the sweep (#225 / #230): admitting a strandable maker
+    /// takes the **exclusive** side of the submit gate, so no such maker can
+    /// be admitted while a sweep holds the shared side. The once-per-sweep
+    /// read and the per-level captures therefore observe the same set.
+    pub(super) strandable_makers_resting: AtomicUsize,
+
     /// The timestamp of market close, if applicable (for DAY orders)
     pub(super) market_close_timestamp: AtomicU64,
 
@@ -116,7 +169,7 @@ pub struct OrderBook<T = ()> {
     /// across its per-level scan and the fill that scan authorises, so no
     /// concurrent add / cancel / update can invalidate either decision
     /// between the two steps. Everything else takes the **read** side and
-    /// stays fully concurrent. [`OrderBook::acquire_submit_gate`] is the
+    /// stays fully concurrent. [`OrderBook::acquire_coherent_submit_gate`] is the
     /// single place that picks the mode, and it documents the scope
     /// limitation.
     ///
@@ -154,6 +207,18 @@ pub struct OrderBook<T = ()> {
     /// neither the hook nor its `Option` check reaches a release binary.
     #[cfg(test)]
     pub(super) stp_interleave_hook: Option<std::sync::Arc<dyn Fn(u128) + Send + Sync>>,
+
+    /// Test-only interleaving hook for the **normal** matching path (#230).
+    ///
+    /// [`Self::stp_interleave_hook`] fires inside the self-trade-prevention
+    /// block, so it never runs on an [`STPMode::None`](super::stp::STPMode)
+    /// book. This one fires just before each crossing level is matched,
+    /// receiving that level's price, which lets a test park a plain sweep
+    /// between two levels and drive a competing admission against it. Like
+    /// its sibling it exists only in `cfg(test)` builds, so neither the hook
+    /// nor its `Option` check reaches a release binary.
+    #[cfg(test)]
+    pub(super) level_interleave_hook: Option<std::sync::Arc<dyn Fn(u128) + Send + Sync>>,
 
     /// listens to possible trades when an order is added
     pub trade_listener: Option<TradeListener>,
@@ -483,9 +548,12 @@ where
             risk_state: RiskState::new(),
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
+            strandable_makers_resting: AtomicUsize::new(0),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
+            #[cfg(test)]
+            level_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -796,11 +864,59 @@ where
         })
     }
 
-    /// Acquire the submit gate in the mode the operation needs: exclusive
-    /// for a fill-or-kill submit (#209) and for every self-trade-prevention
-    /// relevant, matching-capable submit or modify (#225); shared for
-    /// everything else.
+    /// Acquire the submit gate in a mode that is **coherent with the
+    /// strandable-maker count**, restarting in exclusive mode when the
+    /// shared side turns out to be insufficient (#230).
     ///
+    /// `wants_exclusive` is the caller's pre-acquisition decision, from
+    /// [`submit_needs_exclusive_gate`](Self::submit_needs_exclusive_gate) or
+    /// [`modify_needs_exclusive_gate`](Self::modify_needs_exclusive_gate).
+    /// Both read [`strandable_makers_resting`](Self::strandable_makers_resting),
+    /// which can change between that read and the acquisition, so this
+    /// re-reads it once the shared side is held and, if the count is now
+    /// non-zero, **drops the guard and takes the exclusive side afresh**.
+    ///
+    /// That is a restart, not a lock upgrade: `std::sync::RwLock` cannot
+    /// upgrade, and nothing has been read or decided under the shared side
+    /// at this point — the caller has not started its operation yet, so the
+    /// whole operation runs under whichever side this returns.
+    ///
+    /// # The invariant this buys
+    ///
+    /// The count can only **increase** under the exclusive side: the two
+    /// places that increment it are the admission path in `add_order_inner`
+    /// and the snapshot-restore commit, and both hold the exclusive gate
+    /// whenever a strandable maker is involved. So a caller that holds the
+    /// shared side and has re-read the count as zero knows it will stay
+    /// zero for as long as it holds that side. Conversely, in a book that
+    /// *does* hold strandable makers every matching-capable submit and
+    /// re-price runs exclusively, so:
+    ///
+    /// > Every **sweep** in a book holding a strandable maker runs
+    /// > exclusively, so no cancel, mass cancel, admission or re-price can
+    /// > land inside its capture window.
+    ///
+    /// Note the direction: the rule is enforced on the *sweep*, not on the
+    /// cancels. Cancels, mass cancels and `UpdateQuantity` keep the shared
+    /// side and never read the count; they are excluded from a sweep's
+    /// window by that sweep holding the exclusive side, not by taking it
+    /// themselves. Every sweep entry point acquires through this helper —
+    /// the submits, the modifies' re-add, and the match-only paths
+    /// (`match_order`, `match_order_with_user`,
+    /// `match_market_order_by_amount*`) — so an anonymous market sweep is
+    /// covered too.
+    ///
+    /// That is what makes the sweep's capture attribution sound. Without it
+    /// a sweep could capture maker X at a level, have X cancelled and its
+    /// id reused by an unrelated `Standard` order admitted at the same
+    /// level, and then report X's hidden quantity as discarded when it
+    /// filled the impostor.
+    ///
+    /// Cost: a book holding strandable makers serializes its
+    /// matching-capable submits and re-prices, exactly as an STP book has
+    /// since #225. Cancels, mass cancels and `UpdateQuantity` keep the
+    /// shared side — they simply cannot overlap an exclusive sweep in such
+    /// a book. Books that hold none are unaffected: one relaxed load.
     /// # Why exclusive
     ///
     /// Both cases make a decision by reading book state and then act on
@@ -825,11 +941,13 @@ where
     /// its sweep see the same queue state, and a competing admission
     /// blocks here and runs against the post-decision state instead.
     ///
-    /// Scope limitation: mutation performed directly on the
-    /// `Arc<PriceLevel>` handles returned by
-    /// [`get_bids`](Self::get_bids) / [`get_asks`](Self::get_asks)
-    /// bypasses the gate entirely and is outside this guarantee (tracked
-    /// in #228).
+    /// Scope: the public API hands out no level handles — `get_bids` /
+    /// `get_asks`, which cloned the live `Arc<PriceLevel>`s and let a caller
+    /// mutate a level behind the gate, were removed in 0.13.0 (#228). Every
+    /// level mutation therefore goes through `OrderBook` and past this gate.
+    /// The read-only views (`create_snapshot`, the `LevelInfo` iterators,
+    /// `get_orders_at_price`, `best_bid` / `best_ask`, …) hand out values,
+    /// not handles.
     ///
     /// # Invariant: no nested acquisition
     ///
@@ -841,24 +959,67 @@ where
     /// same rule extends to user callbacks: see the re-entrancy contract
     /// on [`TradeListener`], [`PriceLevelChangedListener`] and
     /// [`OrderStateListener`](super::order_state::OrderStateListener).
-    pub(super) fn acquire_submit_gate(&self, exclusive: bool) -> SubmitGateGuard<'_> {
-        if exclusive {
-            SubmitGateGuard::Write(self.submit_gate_write())
-        } else {
-            SubmitGateGuard::Read(self.submit_gate_read())
+    pub(super) fn acquire_coherent_submit_gate(
+        &self,
+        wants_exclusive: bool,
+    ) -> SubmitGateGuard<'_> {
+        if wants_exclusive {
+            return SubmitGateGuard::Write(self.submit_gate_write());
         }
+        let shared = self.submit_gate_read();
+        if self.strandable_makers_resting.load(Ordering::Relaxed) == 0 {
+            return SubmitGateGuard::Read(shared);
+        }
+        // A strandable maker was admitted between the caller's decision and
+        // this acquisition. Release and start over on the exclusive side.
+        drop(shared);
+        SubmitGateGuard::Write(self.submit_gate_write())
     }
 
-    /// Decide the submit gate mode for an incoming order (#209 / #225).
+    /// Decide the submit gate mode for an incoming order (#209 / #225 / #230).
     ///
-    /// Returns `true` — exclusive — when either:
+    /// Returns `true` — exclusive — when any of:
     ///
     /// - the order is fill-or-kill, whose feasibility check and sweep must
-    ///   not interleave with any other mutation (#209); or
+    ///   not interleave with any other mutation (#209);
     /// - self-trade prevention is engaged on this book, the taker carries a
     ///   real identity, and the taker can actually take liquidity, so the
     ///   per-level STP scan and the fill it authorises must observe the same
-    ///   queue state (#225).
+    ///   queue state (#225); or
+    /// - the order is a **strandable maker** — a
+    ///   `ReserveOrder { auto_replenish: false, .. }` with hidden quantity —
+    ///   in **every** [`STPMode`], including
+    ///   [`None`](super::stp::STPMode::None) (#230, see below).
+    ///
+    /// # Why a strandable maker is admitted exclusively
+    ///
+    /// A sweep decides once, up front, whether to run its per-level
+    /// strandable-maker capture, by reading
+    /// [`strandable_makers_resting`](Self::strandable_makers_resting). If a
+    /// strandable maker could be admitted while that sweep is in flight, the
+    /// sweep could consume and remove a maker it never captured, dropping
+    /// the hidden tranche with no report and no counter movement:
+    ///
+    /// ```text
+    /// asks 1@100, 1@101; a buy of 3@101 starts and reads the count as 0
+    /// ...the 100 level fills...
+    /// another thread admits a reserve {visible 1, hidden 20, auto off} @101
+    /// ...the sweep reaches 101, consumes and removes it, reports nothing
+    /// ```
+    ///
+    /// Admitting such a maker on the exclusive side closes that window: the
+    /// admission blocks until every in-flight sweep has released the shared
+    /// side, so the once-per-sweep read and the per-level captures observe
+    /// the same set of strandable makers. The count can still *fall* during
+    /// a sweep (a concurrent cancel), which only leaves the sweep scanning
+    /// for a maker that is already gone — it captures nothing and reports
+    /// nothing, which is correct.
+    ///
+    /// Cost: submitting such a reserve serializes against every other
+    /// submit, cancel, modify and sweep on the book, exactly as a
+    /// fill-or-kill or an STP-relevant submit already did. Nothing else
+    /// changes mode — the shape is rare, and every other submit on an
+    /// `STPMode::None` book keeps the shared, fully concurrent path.
     ///
     /// # Why post-only is excluded
     ///
@@ -898,28 +1059,62 @@ where
         is_fill_or_kill: bool,
         taker_user_id: Hash32,
         is_post_only: bool,
+        rests_strandable_maker: bool,
     ) -> bool {
-        is_fill_or_kill
-            || (self.stp_mode.is_enabled() && taker_user_id != Hash32::zero() && !is_post_only)
+        if is_fill_or_kill || rests_strandable_maker {
+            return true;
+        }
+        // A post-only submit never takes liquidity, so it can neither run
+        // the STP scan nor consume a strandable maker: it stays shared under
+        // both rules.
+        if is_post_only {
+            return false;
+        }
+        (self.stp_mode.is_enabled() && taker_user_id != Hash32::zero())
+            // #230: any submit that can match must not interleave with the
+            // strandable-maker capture of a concurrent sweep, nor have its
+            // own capture invalidated by a concurrent cancel + id reuse.
+            || self.strandable_makers_resting.load(Ordering::Relaxed) > 0
     }
 
-    /// Decide the submit gate mode for an [`OrderUpdate`] (#225).
+    /// Decide the submit gate mode for an [`OrderUpdate`] (#225 / #230).
     ///
-    /// Returns `true` — exclusive — when STP is engaged and the variant is
-    /// one of the cancel-then-add forms whose re-add can match against the
-    /// book (`UpdatePrice`, `UpdatePriceAndQuantity`, `Replace`). Those
-    /// re-adds run the same per-level STP scan as a fresh submit, so they
-    /// carry the same check-then-act window.
+    /// Returns `true` — exclusive — for the cancel-then-add forms whose
+    /// re-add can match against the book (`UpdatePrice`,
+    /// `UpdatePriceAndQuantity`, `Replace`) when either:
+    ///
+    /// - STP is engaged, because those re-adds run the same per-level STP
+    ///   scan as a fresh submit and carry the same check-then-act window
+    ///   (#225); or
+    /// - the book holds **any** strandable maker
+    ///   (`strandable_makers_resting > 0`), in every `STPMode` (#230). The
+    ///   re-add is a matching-capable submit, so it must not interleave with
+    ///   a concurrent sweep's capture; and holding the exclusive side across
+    ///   the *whole* modify — lookup, validation, cancel and re-add — also
+    ///   makes [`check_modify_reserve_residual`](Self::check_modify_reserve_residual)'s
+    ///   crossable-depth dry run exact, since no concurrent mutation can
+    ///   move the opposite side between the estimate and the re-add's sweep.
     ///
     /// `UpdateQuantity` adjusts a resting order in place and `Cancel`
-    /// only removes one, so neither can match and both keep the shared
-    /// side. With STP disabled every variant stays shared.
+    /// only removes one, so neither can match and both keep the shared side
+    /// under either rule.
+    ///
+    /// # Why the count, not a lookup of the order being modified
+    ///
+    /// Deciding from `self.get_order(order_id)` would read book state
+    /// *outside* the gate, where it can go stale before the acquisition:
+    /// the order could be cancelled, or its id reused, between the lookup
+    /// and the gate. The count is the safe pre-acquisition read because it
+    /// is monotone under the shared side —
+    /// [`acquire_coherent_submit_gate`](Self::acquire_coherent_submit_gate)
+    /// re-checks it once the gate is held and restarts exclusively if it
+    /// grew. A resting strandable reserve implies a count of at least one,
+    /// so the coarser rule subsumes the per-order one and additionally
+    /// covers the id-reuse case, where the order being modified is not
+    /// itself strandable but a concurrent sweep's capture is.
     #[inline]
     #[must_use]
     pub(super) fn modify_needs_exclusive_gate(&self, update: &OrderUpdate) -> bool {
-        if !self.stp_mode.is_enabled() {
-            return false;
-        }
         // Exhaustive on purpose: a new `OrderUpdate` variant must force an
         // explicit decision here rather than silently inherit the shared
         // side. `OrderUpdate` is not `#[non_exhaustive]` in pricelevel
@@ -927,7 +1122,10 @@ where
         match update {
             OrderUpdate::UpdatePrice { .. }
             | OrderUpdate::UpdatePriceAndQuantity { .. }
-            | OrderUpdate::Replace { .. } => true,
+            | OrderUpdate::Replace { .. } => {
+                self.stp_mode.is_enabled()
+                    || self.strandable_makers_resting.load(Ordering::Relaxed) > 0
+            }
             OrderUpdate::UpdateQuantity { .. } | OrderUpdate::Cancel { .. } => false,
         }
     }
@@ -1034,9 +1232,12 @@ where
             risk_state: RiskState::new(),
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
+            strandable_makers_resting: AtomicUsize::new(0),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
+            #[cfg(test)]
+            level_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -1085,9 +1286,12 @@ where
             risk_state: RiskState::new(),
             last_trade_price: AtomicCell::new(0),
             has_traded: AtomicBool::new(false),
+            strandable_makers_resting: AtomicUsize::new(0),
             submit_gate: std::sync::RwLock::new(()),
             #[cfg(test)]
             stp_interleave_hook: None,
+            #[cfg(test)]
+            level_interleave_hook: None,
             market_close_timestamp: AtomicU64::new(0),
             has_market_close: AtomicBool::new(false),
             cache: PriceLevelCache::new(),
@@ -3071,8 +3275,9 @@ where
         // per-level scan and the fill it authorises see the same queue. A
         // notional sweep always takes liquidity, hence `is_post_only =
         // false`.
-        let _gate =
-            self.acquire_submit_gate(self.submit_needs_exclusive_gate(false, user_id, false));
+        let _gate = self.acquire_coherent_submit_gate(
+            self.submit_needs_exclusive_gate(false, user_id, false, false),
+        );
         let match_result =
             OrderBook::<T>::match_order_by_amount_with_user(self, order_id, side, amount, user_id)?;
 
@@ -3486,6 +3691,20 @@ where
                         order_id: order.id(),
                     });
                 }
+                // #230: a legacy package can carry the one two-tranche shape
+                // `pricelevel` cannot execute — a non-auto-replenishing
+                // reserve with no visible tranche, which is removed without a
+                // trade and strands its hidden depth at the first taker.
+                // `validate_order_shape` does not run on restore, so reject
+                // it here, in the prepare phase, before any book state is
+                // touched: the restore fails atomically and the live book is
+                // left exactly as it was.
+                if let Some(hidden_quantity) = Self::is_zero_visible_ghost(order.as_ref()) {
+                    return Err(OrderBookError::ZeroVisibleTranche {
+                        order_id: order.id(),
+                        hidden_quantity,
+                    });
+                }
             }
         }
 
@@ -3530,6 +3749,10 @@ where
         #[cfg(feature = "special_orders")]
         self.special_order_tracker.clear();
         self.has_traded.store(false, Ordering::Relaxed);
+        // #230: recounted from the orders installed below, like every other
+        // index this commit rebuilds. Reset here so a restore cannot inherit
+        // the pre-restore book's strandable makers.
+        self.strandable_makers_resting.store(0, Ordering::Relaxed);
         self.last_trade_price.store(0);
         self.has_market_close.store(false, Ordering::Relaxed);
         self.market_close_timestamp.store(0, Ordering::Relaxed);
@@ -3548,6 +3771,12 @@ where
                 for order in &level_orders {
                     self.order_locations.insert(order.id(), (*price, side));
                     self.track_user_order(order.user_id(), order.id());
+                    // #230: the count is not carried by the snapshot; it is
+                    // recounted from what the restore actually installs, so
+                    // a restored non-auto reserve keeps its discard
+                    // reportable and a restore that installs none closes the
+                    // gate.
+                    self.note_rested_order(order.as_ref());
                     #[cfg(feature = "special_orders")]
                     self.reregister_special_order(order.as_ref());
                     if rebuild_risk {
@@ -3570,6 +3799,113 @@ where
         };
         rebuild_side(&prepared.bids, Side::Buy);
         rebuild_side(&prepared.asks, Side::Sell);
+    }
+
+    /// Is `order` the one two-tranche shape `pricelevel` cannot execute
+    /// (#230): a [`OrderType::ReserveOrder`] with `auto_replenish == false`,
+    /// no visible tranche and hidden quantity behind it?
+    ///
+    /// `match_against` returns `(0, None, 0, remaining)` for it — no trade,
+    /// and the maker is removed with its whole hidden tranche stranded — so
+    /// it is a ghost that must never rest. The single source of truth for
+    /// that shape, shared by `validate_order_shape` (admission and every
+    /// modify projection) and by the snapshot-restore prepare phase, which
+    /// deliberately does **not** run the full admission validator.
+    ///
+    /// The sibling shapes are executable and are not covered: a zero-visible
+    /// iceberg draws its whole hidden tranche into visible on match, and a
+    /// zero-visible auto-replenishing reserve refreshes and re-queues.
+    #[inline]
+    #[must_use]
+    pub(super) fn is_zero_visible_ghost<E>(order: &OrderType<E>) -> Option<u64> {
+        match order {
+            OrderType::ReserveOrder {
+                visible_quantity,
+                hidden_quantity,
+                auto_replenish: false,
+                ..
+            } if visible_quantity.as_u64() == 0 && hidden_quantity.as_u64() > 0 => {
+                Some(hidden_quantity.as_u64())
+            }
+            _ => None,
+        }
+    }
+
+    /// Is `order` a maker that will strand hidden quantity if a sweep
+    /// exhausts its visible tranche (#230)? That is exactly a
+    /// [`OrderType::ReserveOrder`] with `auto_replenish == false` and hidden
+    /// depth behind it: `pricelevel` removes it on depletion instead of
+    /// refreshing, dropping the hidden tranche.
+    #[inline]
+    #[must_use]
+    pub(super) fn is_strandable_maker<E>(order: &OrderType<E>) -> bool {
+        matches!(
+            order,
+            OrderType::ReserveOrder {
+                hidden_quantity,
+                auto_replenish: false,
+                ..
+            } if hidden_quantity.as_u64() > 0
+        )
+    }
+
+    /// Count `order` in if it is a strandable maker, on the way onto a
+    /// level.
+    ///
+    /// Called from the only two paths that rest an order: the level
+    /// insertion in `add_order_inner` and the snapshot-restore commit. See
+    /// [`Self::strandable_makers_resting`] for why those two make the count
+    /// exact.
+    #[inline]
+    pub(super) fn note_rested_order<E>(&self, order: &OrderType<E>) {
+        if Self::is_strandable_maker(order) {
+            self.strandable_makers_resting
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Count one strandable maker out, by the saturating rule
+    /// [`Self::note_removed_order`] also uses, when the caller has already
+    /// established that the maker leaving the level is one.
+    ///
+    /// Used by the fill drain in `match_order_inner`, which identifies the
+    /// maker from that sweep's own capture list rather than from an
+    /// `OrderType` it still holds. Single implementation of the saturating
+    /// decrement, so the two removal shapes cannot drift.
+    #[inline]
+    pub(super) fn note_removed_strandable_maker(&self) {
+        let _ = self.strandable_makers_resting.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
+    }
+
+    /// Reset the strandable-maker count to zero.
+    ///
+    /// For the two paths that empty the book wholesale rather than removing
+    /// orders one at a time: the bulk `cancel_all_orders`, and the
+    /// snapshot-restore commit, which then recounts from the orders it
+    /// installs. Both leave nothing resting at the moment they call this, so
+    /// zero is the exact count, not an approximation.
+    #[inline]
+    pub(super) fn reset_strandable_makers(&self) {
+        self.strandable_makers_resting.store(0, Ordering::Relaxed);
+    }
+
+    /// Count `order` out if it is a strandable maker, on the way off a
+    /// level.
+    ///
+    /// Called from the only three paths that remove one:
+    /// `cancel_order_with_reason`, `cancel_resting_maker_on_level` and the
+    /// fill drain in `match_order_inner`. Saturating, so a spurious call can
+    /// never wrap the count below zero; see
+    /// [`Self::strandable_makers_resting`].
+    #[inline]
+    pub(super) fn note_removed_order<E>(&self, order: &OrderType<E>) {
+        if Self::is_strandable_maker(order) {
+            self.note_removed_strandable_maker();
+        }
     }
 
     /// Re-register a restored resting order with the special-order tracker
@@ -3732,30 +4068,6 @@ where
         (bid_volumes, ask_volumes)
     }
 
-    /// Get an Arc reference to the bids as a DashMap
-    ///
-    /// # Note
-    /// Creates a snapshot by collecting all entries into a DashMap
-    pub fn get_bids(&self) -> Arc<DashMap<u128, Arc<PriceLevel>>> {
-        let map = DashMap::new();
-        for entry in self.bids.iter() {
-            map.insert(*entry.key(), entry.value().clone());
-        }
-        Arc::new(map)
-    }
-
-    /// Get an Arc reference to the asks as a DashMap
-    ///
-    /// # Note
-    /// Creates a snapshot by collecting all entries into a DashMap
-    pub fn get_asks(&self) -> Arc<DashMap<u128, Arc<PriceLevel>>> {
-        let map = DashMap::new();
-        for entry in self.asks.iter() {
-            map.insert(*entry.key(), entry.value().clone());
-        }
-        Arc::new(map)
-    }
-
     /// Get a BTreeMap of bids with price as key and PriceLevel as value
     ///
     /// # Errors
@@ -3792,7 +4104,16 @@ where
             .collect()
     }
 
-    /// Get an Arc reference to the order_locations DashMap
+    /// Get a fresh copy of the order-location index, wrapped in an `Arc`.
+    ///
+    /// This is **not** a handle to the live map: the index is cloned
+    /// entry-by-entry and the `Arc` owns the copy, so later admissions,
+    /// cancels and modifies on this book are not reflected in it and writes
+    /// to it do not reach the book. Treat the result as a point-in-time
+    /// snapshot of `order id -> (price, side)`, and re-read it when a
+    /// current view is needed. Cost is proportional to the number of
+    /// resting orders.
+    #[must_use]
     pub fn get_order_locations_arc(&self) -> Arc<DashMap<Id, (u128, Side)>> {
         Arc::new(self.order_locations.clone())
     }
@@ -4387,7 +4708,7 @@ struct PreparedSnapshotLevels {
 /// Guard over the submit gate (#209 / #225) in either mode — held for the
 /// length of one mutating entry-point call. Only the drop timing matters,
 /// hence the unused-field allowances.
-/// [`OrderBook::acquire_submit_gate`] is the single place that picks the
+/// [`OrderBook::acquire_coherent_submit_gate`] is the single place that picks the
 /// mode and carries the full rationale.
 pub(super) enum SubmitGateGuard<'a> {
     /// Shared mode: everything whose decision does not span two operations

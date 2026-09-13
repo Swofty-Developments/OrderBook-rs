@@ -18,6 +18,8 @@ mod snapshot;
 mod statistics_tests;
 mod stp;
 mod stp_concurrency;
+mod strandable_gate_concurrency;
+mod strandable_maker_count;
 mod test_helpers;
 mod time_in_force;
 mod uuid;

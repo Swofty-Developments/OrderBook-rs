@@ -5,14 +5,18 @@
 //!   and hidden tranches (a 15 / 5 split on a lot-10 book used to pass on
 //!   its total of 20) and, additionally, on the capped quantity that
 //!   replenishment moves from hidden into the visible tranche.
+//!   The transfer check applies only while `auto_replenish` is on, the
+//!   single flag that decides whether anything is ever transferred (#230).
 //! - The validate-first modify path projects the updated order through the
 //!   same validator, so a misaligned `UpdateQuantity` /
 //!   `UpdatePriceAndQuantity` / `Replace` is rejected and the original
 //!   order rests untouched.
-//! - Replenishment behaviour itself is unchanged: every refreshed maker and
-//!   every rested residual stays tranche-aligned and conserves quantity, and
-//!   a reserve that never replenishes leaves the book — stranding its hidden
-//!   tranche — when its visible one is depleted.
+//! - Replenishment behaviour is exercised here only for its lot alignment:
+//!   every refreshed maker and every rested residual stays tranche-aligned
+//!   and conserves quantity, and a reserve that never replenishes leaves the
+//!   book — stranding its hidden tranche — when its visible one is depleted.
+//!   The residual policy itself (what an exhausted non-auto reserve residual
+//!   does) lives in `reserve_residual_policy_tests`.
 
 #[cfg(test)]
 mod tests_reserve_lot_size {
@@ -143,21 +147,37 @@ mod tests_reserve_lot_size {
 
     /// Both tranches are aligned, but replenishment would move 7 units into
     /// the visible tranche — an aggressive fill of 10 would leave the order
-    /// resting as 7 / 13. Rejected on the transfer, whatever `auto_replenish`
-    /// says, because the residual-resting path refreshes from
-    /// `replenish_amount` regardless.
+    /// resting as 7 / 13. Rejected on the transfer.
     #[test]
-    fn test_add_order_reserve_misaligned_replenish_amount_rejects() {
+    fn test_add_order_reserve_misaligned_replenish_amount_with_auto_rejects() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-LOT", 10);
         let order_id = Id::new();
 
-        let result = book.add_order(reserve_buy(order_id, 10, 20, 0, Some(7), false));
+        let result = book.add_order(reserve_buy(order_id, 10, 20, 0, Some(7), true));
 
         assert_invalid_lot(result, 7, 10);
         assert!(
             book.get_order(order_id).is_none(),
             "a rejected reserve must not rest"
         );
+    }
+
+    /// The identical shape is admitted without `auto_replenish` (#230): no
+    /// transfer ever happens on either path — a depleted visible tranche
+    /// removes the resting maker and ends the aggressive residual — so the
+    /// misaligned 7 can never be displayed and is not validated.
+    #[test]
+    fn test_add_order_reserve_misaligned_replenish_amount_without_auto_accepts() {
+        let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-LOT", 10);
+        let order_id = Id::new();
+
+        let result = book.add_order(reserve_buy(order_id, 10, 20, 0, Some(7), false));
+
+        assert!(
+            result.is_ok(),
+            "non-replenishing reserve rejected on a dead amount: {result:?}"
+        );
+        assert_eq!(resting_tranches(&book, order_id), (10, 20));
     }
 
     /// Without an explicit amount, an auto-replenishing reserve transfers
@@ -384,16 +404,16 @@ mod tests_reserve_lot_size {
         assert_conserved(executed, visible, hidden, 60);
     }
 
-    /// The upstream half of the `(None, auto_replenish = false)` exemption:
-    /// with automatic replenishment off, `pricelevel`'s `match_against`
+    /// The upstream half of the `auto_replenish = false` exemption: with
+    /// automatic replenishment off, `pricelevel`'s `match_against`
     /// returns `(consumed, None, 0, remaining)` once the visible tranche is
     /// fully consumed, so the level **removes** the maker instead of
     /// refreshing it — the hidden tranche is stranded and dropped. Nothing
     /// is ever transferred, which is exactly why admission skips the
     /// transfer check for this policy: the book can never end up displaying
-    /// a non-aligned visible tranche. (The local half — the residual-resting
-    /// helper refreshing zero without a `replenish_amount` — is pinned by
-    /// `test_reserve_taker_residual_rests_aligned_tranches`.)
+    /// a non-aligned visible tranche. (The local half — an exhausted
+    /// non-auto residual ending instead of resting — is pinned by
+    /// `reserve_residual_policy_tests`.)
     #[test]
     fn test_reserve_maker_without_auto_replenish_leaves_book_on_depletion() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-NO-AUTO", 25);
@@ -446,18 +466,15 @@ mod tests_reserve_lot_size {
         assert_conserved(executed, visible, hidden, 25);
     }
 
-    /// Aggressive residual resting: a reserve taker that fills its whole
-    /// visible tranche rests its residual through `set_total_remaining`,
-    /// whose helper refreshes the emptied visible tranche with
-    /// `min(replenish_amount, hidden)` — without consulting
-    /// `auto_replenish`, which is why the amount is validated at admission
-    /// even when auto-replenishment is off. The residual rests 10 / 10.
+    /// Aggressive residual resting: an **auto-replenishing** reserve taker
+    /// that fills its whole visible tranche rests its residual through
+    /// `set_total_remaining`, whose helper refreshes the emptied visible
+    /// tranche with `min(replenish_amount, hidden)` — the same transfer
+    /// admission validated. The residual rests 10 / 10, lot-aligned and
+    /// conserved.
     ///
-    /// That 10 / 10 outcome records the current, known-divergent behaviour of
-    /// the residual helper (#230 tracks reconciling it with `pricelevel`'s
-    /// `auto_replenish` contract for resting makers), not a chosen policy:
-    /// what this test pins is lot alignment and conservation, which must hold
-    /// whichever way #230 is resolved.
+    /// With automatic replenishment off the residual does not rest at all
+    /// (#230); that policy is covered by `reserve_residual_policy_tests`.
     #[test]
     fn test_reserve_taker_residual_rests_aligned_tranches() {
         let book: OrderBook<()> = OrderBook::with_lot_size("RESERVE-TAKER", 10);
@@ -469,7 +486,7 @@ mod tests_reserve_lot_size {
 
         let taker_id = Id::new();
         let submitted =
-            book.add_order_with_result(reserve_buy(taker_id, 10, 20, 0, Some(10), false));
+            book.add_order_with_result(reserve_buy(taker_id, 10, 20, 0, Some(10), true));
         let executed = match submitted {
             Ok((_, Some(trade))) => match trade.match_result.executed_quantity() {
                 Ok(quantity) => quantity.as_u64(),
@@ -505,7 +522,7 @@ mod tests_reserve_lot_size {
         );
 
         let taker_id = Id::new();
-        let result = book.add_order(reserve_buy(taker_id, 10, 20, 0, Some(7), false));
+        let result = book.add_order(reserve_buy(taker_id, 10, 20, 0, Some(7), true));
 
         assert_invalid_lot(result, 7, 10);
         assert!(

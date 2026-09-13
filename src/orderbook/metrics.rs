@@ -17,6 +17,17 @@
 //!   of distinct price levels on each side.
 //! - `orderbook_trades_total` — counter, incremented exactly once per
 //!   emitted trade transaction (a `MatchResult` may contain several).
+//! - `orderbook_reserve_discards_total` /
+//!   `orderbook_reserve_hidden_discarded_total` — counters, incremented
+//!   whenever a reserve without automatic replenishment loses its hidden
+//!   tranche because its visible one was exhausted (#230). The first
+//!   counts orders, the second sums the hidden quantity that was dropped;
+//!   neither can be derived from the other. Both sides of the trade feed
+//!   them: the aggressive residual guard in `modifications.rs`
+//!   (`add_order_inner`) and the maker removal in `matching.rs`, which
+//!   `pricelevel` performs when a depleted non-replenishing maker leaves
+//!   its level. The matching `INFO` trace carries a `path` field
+//!   (`"taker"` / `"maker"`) so the two are distinguishable.
 //!
 //! # Determinism
 //!
@@ -42,6 +53,14 @@ pub const DEPTH_LEVELS_ASK: &str = "orderbook_depth_levels_ask";
 
 /// Counter name: monotonic count of every emitted trade transaction.
 pub const TRADES_TOTAL: &str = "orderbook_trades_total";
+
+/// Counter name: reserve residuals discarded for lack of automatic
+/// replenishment (#230), counted in orders.
+pub const RESERVE_DISCARDS_TOTAL: &str = "orderbook_reserve_discards_total";
+
+/// Counter name: hidden quantity dropped by those discards (#230),
+/// counted in quantity units.
+pub const RESERVE_HIDDEN_DISCARDED_TOTAL: &str = "orderbook_reserve_hidden_discarded_total";
 
 /// Record an order rejection.
 ///
@@ -97,11 +116,43 @@ pub fn record_trades(n: u64) {
 #[cfg(not(feature = "metrics"))]
 pub fn record_trades(_n: u64) {}
 
+/// Record one discarded reserve residual and the hidden quantity it
+/// dropped (#230).
+///
+/// Increments `orderbook_reserve_discards_total` by 1 and
+/// `orderbook_reserve_hidden_discarded_total` by `quantity`. Called once
+/// per dropped order from each of the two paths that can drop one, both
+/// requiring `auto_replenish == false` and an exhausted visible tranche:
+///
+/// - the aggressive residual guard in `add_order_inner`
+///   (`modifications.rs`), where the taker's residual is discarded instead
+///   of rested;
+/// - the maker removal in `match_order_inner` (`matching.rs`), where
+///   `pricelevel` takes a resting maker off its level and strands the
+///   hidden depth behind it.
+///
+/// A zero `quantity` is not a discard and is ignored. Compiles to a no-op
+/// when the `metrics` feature is disabled.
+#[inline]
+#[cfg(feature = "metrics")]
+pub fn record_reserve_hidden_discarded(quantity: u64) {
+    if quantity == 0 {
+        return;
+    }
+    metrics::counter!(RESERVE_DISCARDS_TOTAL).increment(1);
+    metrics::counter!(RESERVE_HIDDEN_DISCARDED_TOTAL).increment(quantity);
+}
+
+/// No-op when the `metrics` feature is disabled.
+#[inline]
+#[cfg(not(feature = "metrics"))]
+pub fn record_reserve_hidden_discarded(_quantity: u64) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// All four call-sites must compile and run without panicking
+    /// Every call-site must compile and run without panicking
     /// regardless of feature state. The actual counter behaviour is
     /// covered by `tests/metrics/` (feature-gated).
     #[test]
@@ -112,5 +163,7 @@ mod tests {
         record_depth(3, 5);
         record_trades(0);
         record_trades(4);
+        record_reserve_hidden_discarded(0);
+        record_reserve_hidden_discarded(20);
     }
 }

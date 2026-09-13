@@ -4,7 +4,9 @@
 //! only checked on its *total*, so a 15 visible / 5 hidden reserve slipped
 //! into a lot-10 book while the identical iceberg was rejected. The reserve
 //! now takes the iceberg's per-tranche rule plus a check on the capped
-//! transfer that replenishment moves from hidden into the visible tranche.
+//! transfer that replenishment moves from hidden into the visible tranche —
+//! the latter only while `auto_replenish` is on, the single flag that
+//! decides whether anything is ever transferred (#230).
 
 #[cfg(test)]
 mod tests {
@@ -117,18 +119,24 @@ mod tests {
 
     // --- Reserve: the capped replenishment transfer ---
 
-    /// An explicit replenish amount is validated whatever `auto_replenish`
-    /// says: the residual-resting helper refreshes with it regardless. A
-    /// 10/20 reserve replenishing 7 would otherwise rest as 7/13.
+    /// An explicit replenish amount is dead configuration without
+    /// `auto_replenish` (#230): nothing is ever transferred on either path —
+    /// `pricelevel` removes a depleted resting maker and the residual helper
+    /// leaves the visible tranche empty, which ends the order — so the
+    /// misaligned 7 cannot reach a level and the order is accepted.
     #[test]
-    fn test_validate_order_shape_reserve_misaligned_replenish_amount_rejects() {
+    fn test_validate_order_shape_reserve_misaligned_replenish_amount_without_auto_accepts() {
         let book = book_with_lot(10);
         let result = book.validate_order_shape(&reserve(10, 20, 0, Some(7), false));
-        assert_invalid_lot(result, 7, 10);
+        assert!(
+            result.is_ok(),
+            "non-replenishing reserve rejected on a dead amount: {result:?}"
+        );
     }
 
-    /// The same amount is rejected with `auto_replenish` on, where it is
-    /// `pricelevel`'s transfer as well.
+    /// The same amount is rejected with `auto_replenish` on, where it is the
+    /// transfer both `pricelevel` and the residual helper perform: a 10/20
+    /// reserve replenishing 7 would otherwise rest as 7/13.
     #[test]
     fn test_validate_order_shape_reserve_misaligned_replenish_amount_auto_rejects() {
         let book = book_with_lot(10);
@@ -142,7 +150,7 @@ mod tests {
     #[test]
     fn test_validate_order_shape_reserve_replenish_amount_capped_by_hidden_accepts() {
         let book = book_with_lot(10);
-        let result = book.validate_order_shape(&reserve(10, 20, 0, Some(25), false));
+        let result = book.validate_order_shape(&reserve(10, 20, 0, Some(25), true));
         assert!(result.is_ok(), "capped transfer rejected: {result:?}");
     }
 
@@ -286,9 +294,12 @@ mod tests {
 
     // --- The narrowed symmetry ---
 
-    /// Iceberg and Reserve share *identical* visible / hidden validation. The
-    /// replenishment rule is Reserve-only, so the shared verdict is asserted
-    /// on a reserve that never transfers (`None` amount, no auto-replenish).
+    /// Iceberg and Reserve share *identical* **lot-size** validation. Two
+    /// Reserve-only rules break the symmetry and are asserted separately: the
+    /// replenishment transfer check (so the shared verdict is taken on a
+    /// reserve that never transfers, `auto_replenish` off), and the
+    /// zero-visible ghost rule, which applies to the non-auto reserve alone
+    /// (#230) and is asserted as an explicit divergence inside the loop.
     #[test]
     fn test_validate_order_shape_iceberg_and_reserve_share_tranche_verdicts() {
         let book = book_with_lot(10);
@@ -307,6 +318,34 @@ mod tests {
             let iceberg_verdict = book.validate_order_shape(&iceberg(visible, hidden));
             let reserve_verdict =
                 book.validate_order_shape(&reserve(visible, hidden, 0, None, false));
+
+            // The one deliberate asymmetry (#230). A zero visible tranche
+            // behind hidden depth is a ghost ONLY for a non-auto-replenishing
+            // reserve: `pricelevel` removes it without a trade and strands the
+            // hidden. The identical iceberg executes — its degenerate guard
+            // draws the whole hidden tranche into visible on match — so it
+            // stays admissible and the two kinds diverge here on purpose.
+            if visible == 0 && hidden > 0 {
+                assert!(
+                    iceberg_verdict.is_ok(),
+                    "{visible}/{hidden}: a zero-visible iceberg is executable, \
+                     so it must be accepted: {iceberg_verdict:?}"
+                );
+                match &reserve_verdict {
+                    Err(OrderBookError::ZeroVisibleTranche {
+                        hidden_quantity, ..
+                    }) => assert_eq!(
+                        *hidden_quantity, hidden,
+                        "{visible}/{hidden}: the stranded tranche is reported"
+                    ),
+                    other => panic!(
+                        "{visible}/{hidden}: a zero-visible non-auto reserve must be \
+                         rejected as a ghost, got {other:?}"
+                    ),
+                }
+                continue;
+            }
+
             match (&iceberg_verdict, &reserve_verdict) {
                 (Ok(()), Ok(())) => {}
                 (

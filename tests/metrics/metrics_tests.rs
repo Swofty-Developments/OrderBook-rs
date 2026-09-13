@@ -8,10 +8,11 @@
 
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
 use orderbook_rs::orderbook::metrics::{
-    DEPTH_LEVELS_ASK, DEPTH_LEVELS_BID, REJECTS_TOTAL, TRADES_TOTAL,
+    DEPTH_LEVELS_ASK, DEPTH_LEVELS_BID, REJECTS_TOTAL, RESERVE_DISCARDS_TOTAL,
+    RESERVE_HIDDEN_DISCARDED_TOTAL, TRADES_TOTAL,
 };
 use orderbook_rs::{OrderBook, StubClock};
-use pricelevel::{Id, Side, TimeInForce};
+use pricelevel::{Hash32, Id, OrderType, Price, Quantity, Side, TimeInForce, TimestampMs};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -277,4 +278,175 @@ fn strip_level_statistics(mut value: serde_json::Value) -> serde_json::Value {
         }
     }
     value
+}
+
+/// A reserve BUY at 100 with 10 visible / 20 hidden and the given
+/// replenishment policy.
+fn reserve_buy(id: Id, auto_replenish: bool) -> OrderType<()> {
+    OrderType::ReserveOrder {
+        id,
+        price: Price::new(100),
+        visible_quantity: Quantity::new(10),
+        hidden_quantity: Quantity::new(20),
+        side: Side::Buy,
+        user_id: Hash32::zero(),
+        timestamp: TimestampMs::new(0),
+        time_in_force: TimeInForce::Gtc,
+        replenish_threshold: Quantity::new(0),
+        replenish_amount: None,
+        auto_replenish,
+        extra_fields: (),
+    }
+}
+
+/// #230: the engine-side measurement of discarded quantity. A reserve
+/// taker whose visible tranche the sweep exhausts without automatic
+/// replenishment drops its hidden remainder; both the order count and the
+/// quantity are counted, and neither moves when the residual rests.
+///
+/// This lives here rather than in `tests/unit/` because only this test
+/// binary installs a `metrics` recorder: the conservation assertions over
+/// in `reserve_residual_policy_tests` therefore measure `executed` three
+/// independent ways and take the discard as a per-case literal, while the
+/// engine's own count of what it dropped is asserted here.
+#[test]
+fn reserve_discard_counters_track_dropped_hidden_quantity() {
+    let _guard = serialized_test_lock().lock().expect("serialized lock");
+    install_recorder();
+
+    let discards_before = counter_value(RESERVE_DISCARDS_TOTAL);
+    let quantity_before = counter_value(RESERVE_HIDDEN_DISCARDED_TOTAL);
+
+    // Resting branch: an auto-replenishing residual refreshes and rests, so
+    // nothing is discarded and neither counter may move.
+    let resting_book = OrderBook::<()>::new("METRICS-RSV-REST");
+    resting_book
+        .add_limit_order(Id::new_uuid(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
+        .expect("seed contra depth");
+    resting_book
+        .add_order(reserve_buy(Id::new_uuid(), true))
+        .expect("auto-replenishing reserve rests its residual");
+
+    assert_eq!(
+        counter_value(RESERVE_DISCARDS_TOTAL),
+        discards_before,
+        "a refreshed, resting residual must not count as a discard"
+    );
+    assert_eq!(
+        counter_value(RESERVE_HIDDEN_DISCARDED_TOTAL),
+        quantity_before,
+        "a refreshed, resting residual must not count discarded quantity"
+    );
+
+    // Discard branch: the same shape without automatic replenishment ends
+    // with its 20 hidden units dropped.
+    let discard_book = OrderBook::<()>::new("METRICS-RSV-DISCARD");
+    discard_book
+        .add_limit_order(Id::new_uuid(), 100, 10, Side::Sell, TimeInForce::Gtc, None)
+        .expect("seed contra depth");
+    discard_book
+        .add_order(reserve_buy(Id::new_uuid(), false))
+        .expect("the submit succeeds; the residual is discarded, not rejected");
+
+    assert_eq!(
+        counter_value(RESERVE_DISCARDS_TOTAL) - discards_before,
+        1,
+        "orderbook_reserve_discards_total must count exactly one discarded order"
+    );
+    assert_eq!(
+        counter_value(RESERVE_HIDDEN_DISCARDED_TOTAL) - quantity_before,
+        20,
+        "orderbook_reserve_hidden_discarded_total must count the 20 dropped hidden units"
+    );
+}
+
+/// #230: the maker side of the same discard feeds the same counters. A
+/// non-auto-replenishing reserve resting as a maker is removed by
+/// `pricelevel` once its visible tranche is taken, stranding its hidden
+/// depth; that is the same loss of resting quantity as the aggressive
+/// residual discard and must be just as observable.
+#[test]
+fn reserve_discard_counters_track_the_maker_path_too() {
+    let _guard = serialized_test_lock().lock().expect("serialized lock");
+    install_recorder();
+
+    let discards_before = counter_value(RESERVE_DISCARDS_TOTAL);
+    let quantity_before = counter_value(RESERVE_HIDDEN_DISCARDED_TOTAL);
+
+    // The reserve rests as a maker, then an aggressive sell of 20 arrives.
+    // Only the maker's visible tranche of 10 is exposed, so the sell takes
+    // that, the level drops the 20 hidden with the maker, and the sell rests
+    // its own remainder of 10 as an ask.
+    let book = OrderBook::<()>::new("METRICS-RSV-MAKER");
+    let maker_id = Id::new_uuid();
+    book.add_order(reserve_buy(maker_id, false))
+        .expect("the reserve rests as a maker");
+    book.add_limit_order(Id::new_uuid(), 100, 20, Side::Sell, TimeInForce::Gtc, None)
+        .expect("the aggressive sell takes the visible tranche");
+
+    assert!(
+        book.get_order(maker_id).is_none(),
+        "the depleted non-replenishing maker leaves the book"
+    );
+    assert_eq!(
+        book.best_ask(),
+        Some(100),
+        "the sell rests the 10 the stranded hidden tranche could not fill"
+    );
+    assert_eq!(
+        counter_value(RESERVE_DISCARDS_TOTAL) - discards_before,
+        1,
+        "the maker removal must count exactly one discarded order"
+    );
+    assert_eq!(
+        counter_value(RESERVE_HIDDEN_DISCARDED_TOTAL) - quantity_before,
+        20,
+        "the maker removal must count the 20 stranded hidden units"
+    );
+}
+
+/// A maker that **does** replenish is not a discard: automatic
+/// replenishment refreshes its visible tranche from hidden, so nothing is
+/// lost and neither counter moves.
+#[test]
+fn reserve_discard_counters_ignore_a_replenishing_maker() {
+    let _guard = serialized_test_lock().lock().expect("serialized lock");
+    install_recorder();
+
+    let discards_before = counter_value(RESERVE_DISCARDS_TOTAL);
+    let quantity_before = counter_value(RESERVE_HIDDEN_DISCARDED_TOTAL);
+
+    let book = OrderBook::<()>::new("METRICS-RSV-MAKER-AUTO");
+    let maker_id = Id::new_uuid();
+    book.add_order(reserve_buy(maker_id, true))
+        .expect("the reserve rests as a maker");
+    book.add_limit_order(Id::new_uuid(), 100, 20, Side::Sell, TimeInForce::Gtc, None)
+        .expect("the aggressive sell takes the visible tranche");
+
+    // The same sell of 20 against a replenishing maker: the first 10 take
+    // the visible tranche, `min(80, 20) = 20` refreshes it from hidden, and
+    // the remaining 10 come out of the refreshed tranche. The maker survives
+    // holding 10 visible / 0 hidden, so the full 30 stays accounted for and
+    // nothing was dropped.
+    match book.get_order(maker_id) {
+        Some(order) => assert_eq!(
+            (
+                order.visible_quantity().as_u64(),
+                order.hidden_quantity().as_u64()
+            ),
+            (10, 0),
+            "a replenishing maker survives, refreshed and then partly taken"
+        ),
+        None => panic!("a replenishing maker must not leave the book"),
+    }
+    assert_eq!(
+        counter_value(RESERVE_DISCARDS_TOTAL),
+        discards_before,
+        "a refreshed maker must not count as a discard"
+    );
+    assert_eq!(
+        counter_value(RESERVE_HIDDEN_DISCARDED_TOTAL),
+        quantity_before,
+        "a refreshed maker must not count discarded quantity"
+    );
 }

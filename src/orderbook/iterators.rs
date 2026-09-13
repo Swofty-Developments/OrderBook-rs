@@ -45,10 +45,15 @@ pub struct LevelsWithCumulativeDepth<'a> {
 impl<'a> LevelsWithCumulativeDepth<'a> {
     /// Creates a new iterator over levels with cumulative depth
     ///
+    /// Crate-private since 0.13.0 (#228): the parameter is a reference to
+    /// the book's live level map, and no public API hands one out. Obtain
+    /// the iterator from
+    /// [`OrderBook::levels_with_cumulative_depth`](crate::OrderBook::levels_with_cumulative_depth).
+    ///
     /// # Arguments
     /// - `price_levels`: Reference to the SkipMap of price levels
     /// - `side`: Side to iterate (Buy for bids, Sell for asks)
-    pub fn new(price_levels: &'a SkipMap<u128, Arc<PriceLevel>>, side: Side) -> Self {
+    pub(crate) fn new(price_levels: &'a SkipMap<u128, Arc<PriceLevel>>, side: Side) -> Self {
         let iter = match side {
             Side::Buy => Either::Left(price_levels.iter().rev()), // Highest to lowest
             Side::Sell => Either::Right(price_levels.iter()),     // Lowest to highest
@@ -93,11 +98,16 @@ pub struct LevelsUntilDepth<'a> {
 impl<'a> LevelsUntilDepth<'a> {
     /// Creates a new iterator that stops at target depth
     ///
+    /// Crate-private since 0.13.0 (#228): the parameter is a reference to
+    /// the book's live level map, and no public API hands one out. Obtain
+    /// the iterator from
+    /// [`OrderBook::levels_until_depth`](crate::OrderBook::levels_until_depth).
+    ///
     /// # Arguments
     /// - `price_levels`: Reference to the SkipMap of price levels
     /// - `side`: Side to iterate (Buy for bids, Sell for asks)
     /// - `target_depth`: Target cumulative depth (in units)
-    pub fn new(
+    pub(crate) fn new(
         price_levels: &'a SkipMap<u128, Arc<PriceLevel>>,
         side: Side,
         target_depth: u64,
@@ -160,12 +170,17 @@ pub struct LevelsInRange<'a> {
 impl<'a> LevelsInRange<'a> {
     /// Creates a new iterator over levels in a price range
     ///
+    /// Crate-private since 0.13.0 (#228): the parameter is a reference to
+    /// the book's live level map, and no public API hands one out. Obtain
+    /// the iterator from
+    /// [`OrderBook::levels_in_range`](crate::OrderBook::levels_in_range).
+    ///
     /// # Arguments
     /// - `price_levels`: Reference to the SkipMap of price levels
     /// - `side`: Side to iterate (Buy for bids, Sell for asks)
     /// - `min_price`: Minimum price (inclusive, in price units)
     /// - `max_price`: Maximum price (inclusive, in price units)
-    pub fn new(
+    pub(crate) fn new(
         price_levels: &'a SkipMap<u128, Arc<PriceLevel>>,
         side: Side,
         min_price: u128,

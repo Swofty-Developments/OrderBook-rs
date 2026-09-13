@@ -228,6 +228,12 @@ where
         // 3. Clear tracking maps
         self.order_locations.clear();
         self.user_orders.clear();
+        // #230: `cancel_all_orders` is the one removal path that does not go
+        // through `cancel_order_with_reason` — it empties the whole book in
+        // bulk — so the strandable-maker tally collapses to a single reset
+        // here, the same way the risk state does below. Nothing rests
+        // afterwards, so the exact count is zero.
+        self.reset_strandable_makers();
 
         // 4. Drain both SkipMaps
         while self.bids.pop_front().is_some() {}

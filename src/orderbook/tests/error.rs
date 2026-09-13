@@ -113,4 +113,102 @@ mod tests {
             ),
         }
     }
+
+    // --- #230: the two new variants ---
+
+    /// `ZeroVisibleTranche` names the order and the tranche that would be
+    /// stranded, and clones field-for-field.
+    #[test]
+    fn test_zero_visible_tranche_display_and_clone() {
+        let order_id = pricelevel::Id::from_u64(77);
+        let error = OrderBookError::ZeroVisibleTranche {
+            order_id,
+            hidden_quantity: 20,
+        };
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("zero visible tranche"),
+            "names the rule: {rendered}"
+        );
+        assert!(
+            rendered.contains("20"),
+            "names the hidden tranche: {rendered}"
+        );
+        assert!(
+            rendered.contains(&order_id.to_string()),
+            "names the order: {rendered}"
+        );
+
+        match error.clone() {
+            OrderBookError::ZeroVisibleTranche {
+                order_id: cloned_id,
+                hidden_quantity,
+            } => {
+                assert_eq!(cloned_id, order_id);
+                assert_eq!(hidden_quantity, 20);
+            }
+            other => panic!("clone changed the variant: {other:?}"),
+        }
+        assert_eq!(
+            error.clone().to_string(),
+            rendered,
+            "clone renders the same"
+        );
+    }
+
+    /// `ReserveResidualWouldBeDiscarded` distinguishes the projected hidden
+    /// tranche from the quantity that would actually be destroyed.
+    #[test]
+    fn test_reserve_residual_would_be_discarded_display_and_clone() {
+        let order_id = pricelevel::Id::from_u64(78);
+        let error = OrderBookError::ReserveResidualWouldBeDiscarded {
+            order_id,
+            visible_quantity: 10,
+            crossable_quantity: 15,
+            hidden_quantity: 20,
+            discarded_quantity: 15,
+        };
+
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("would cross 15 units"),
+            "names the crossable depth: {rendered}"
+        );
+        assert!(
+            rendered.contains("visible tranche of 10"),
+            "names the visible tranche: {rendered}"
+        );
+        assert!(
+            rendered.contains("discarding 15 of its 20 hidden units"),
+            "separates destroyed from projected hidden: {rendered}"
+        );
+
+        match error.clone() {
+            OrderBookError::ReserveResidualWouldBeDiscarded {
+                order_id: cloned_id,
+                visible_quantity,
+                crossable_quantity,
+                hidden_quantity,
+                discarded_quantity,
+            } => {
+                assert_eq!(cloned_id, order_id);
+                assert_eq!(
+                    (
+                        visible_quantity,
+                        crossable_quantity,
+                        hidden_quantity,
+                        discarded_quantity
+                    ),
+                    (10, 15, 20, 15)
+                );
+            }
+            other => panic!("clone changed the variant: {other:?}"),
+        }
+        assert_eq!(
+            error.clone().to_string(),
+            rendered,
+            "clone renders the same"
+        );
+    }
 }

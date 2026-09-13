@@ -773,23 +773,23 @@ mod tests {
 
         let plain: OrderBook<()> = OrderBook::new("GATE-NONE");
         assert!(
-            !plain.submit_needs_exclusive_gate(false, u, false),
+            !plain.submit_needs_exclusive_gate(false, u, false, false),
             "STPMode::None keeps the shared path even with a real user"
         );
         assert!(
-            !plain.submit_needs_exclusive_gate(false, Hash32::zero(), false),
+            !plain.submit_needs_exclusive_gate(false, Hash32::zero(), false, false),
             "STPMode::None with an anonymous taker stays shared"
         );
         assert!(
-            !plain.submit_needs_exclusive_gate(false, u, true),
+            !plain.submit_needs_exclusive_gate(false, u, true, false),
             "STPMode::None with a post-only taker stays shared"
         );
         assert!(
-            plain.submit_needs_exclusive_gate(true, Hash32::zero(), false),
+            plain.submit_needs_exclusive_gate(true, Hash32::zero(), false, false),
             "fill-or-kill is exclusive regardless of STP (#209)"
         );
         assert!(
-            plain.submit_needs_exclusive_gate(true, u, false),
+            plain.submit_needs_exclusive_gate(true, u, false, false),
             "fill-or-kill is exclusive regardless of user"
         );
 
@@ -801,15 +801,15 @@ mod tests {
             let mut book: OrderBook<()> = OrderBook::new("GATE-STP");
             book.set_stp_mode(mode);
             assert!(
-                !book.submit_needs_exclusive_gate(false, Hash32::zero(), false),
+                !book.submit_needs_exclusive_gate(false, Hash32::zero(), false, false),
                 "{mode}: an anonymous taker skips STP, so it stays shared"
             );
             assert!(
-                book.submit_needs_exclusive_gate(false, u, false),
+                book.submit_needs_exclusive_gate(false, u, false, false),
                 "{mode}: an STP-relevant submit takes the exclusive gate"
             );
             assert!(
-                book.submit_needs_exclusive_gate(true, u, false),
+                book.submit_needs_exclusive_gate(true, u, false, false),
                 "{mode}: fill-or-kill stays exclusive"
             );
             // A post-only taker resolves before the STP scan is reached, so
@@ -817,11 +817,11 @@ mod tests {
             // shared side even on an STP book with a real identity (#225,
             // review finding F3).
             assert!(
-                !book.submit_needs_exclusive_gate(false, u, true),
+                !book.submit_needs_exclusive_gate(false, u, true, false),
                 "{mode}: a post-only taker never reaches the STP scan"
             );
             assert!(
-                !book.submit_needs_exclusive_gate(false, Hash32::zero(), true),
+                !book.submit_needs_exclusive_gate(false, Hash32::zero(), true, false),
                 "{mode}: an anonymous post-only taker stays shared"
             );
             // Not representable today — `OrderType::PostOnly` carries no
@@ -829,7 +829,7 @@ mod tests {
             // if it ever becomes representable the #209 all-or-nothing
             // window must still win over the post-only exemption.
             assert!(
-                book.submit_needs_exclusive_gate(true, u, true),
+                book.submit_needs_exclusive_gate(true, u, true, false),
                 "{mode}: fill-or-kill outranks the post-only exemption"
             );
         }
