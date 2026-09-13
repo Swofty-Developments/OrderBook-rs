@@ -315,40 +315,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry describes and no further, and the narrowing removes rejections
   #226 would otherwise have raised on non-auto-replenishing reserves.
 
-- **A two-tranche order must display a positive visible tranche (#230).**
-  An `IcebergOrder` or `ReserveOrder` with `visible_quantity == 0` and
-  `hidden_quantity > 0` was admitted happily, and rested as a ghost: it
-  showed no visible depth, could not be filled, and `pricelevel` removed it
-  — stranding the whole hidden tranche — the first time a taker reached its
-  level. Since #221 every quantity-carrying modify sets the **visible**
-  tranche, so `UpdateQuantity { new_quantity: 0 }`,
-  `UpdatePriceAndQuantity` and `Replace` with a zero quantity could drive a
-  healthy resting order into that shape as well. `validate_order_shape` now
-  rejects it with the new `OrderBookError::ZeroVisibleTranche { order_id,
-  hidden_quantity }`, which covers `add_order` and every modify projection
+- **A non-replenishing reserve must display a positive visible tranche
+  (#230).** A `ReserveOrder` with `auto_replenish == false`,
+  `visible_quantity == 0` and `hidden_quantity > 0` was admitted happily,
+  and rested as a ghost: it showed no visible depth, could not be filled,
+  and `pricelevel` removed it — stranding the whole hidden tranche — the
+  first time a taker reached its level. Since #221 every quantity-carrying
+  modify sets the **visible** tranche, so `UpdatePriceAndQuantity` and
+  `Replace` with a zero quantity could drive a healthy resting reserve into
+  that shape as well. `UpdateQuantity { new_quantity: 0 }` cannot: it is a
+  removal, taken before the validator ever runs (#223, below).
+  `validate_order_shape` now rejects it with the new
+  `OrderBookError::ZeroVisibleTranche { order_id, hidden_quantity }`, which
+  covers `add_order` and every modify projection
   through the one shared validator; a rejected modify leaves the original
   resting untouched. The error maps to the existing wire code
   `RejectReason::InvalidQuantity`, alongside `QuantityOverflow`.
 
-  Scope: single-tranche kinds are unaffected, and a `(0, 0)` two-tranche
-  order is not covered by this rule — it carries nothing to strand. The
-  residual paths already produce a positive visible tranche for every
-  admitted order, so this closes the remaining way to create one.
+  Scope: that shape **only**. The other zero-visible two-tranche shapes
+  execute rather than vanishing, so they stay admissible — an
+  `IcebergOrder` draws its whole hidden tranche into visible on match, and
+  an auto-replenishing `ReserveOrder` refreshes and re-queues.
+  Single-tranche kinds are unaffected, and a `(0, 0)` reserve is not
+  covered — it carries nothing to strand. The residual paths already
+  produce a positive visible tranche for every admitted order, so this
+  closes the remaining way to create one.
 
-  Compatibility: admission is strictly tighter. The case to check for is a
-  **soft cancel**: an integrator that sent
-  `UpdateQuantity { new_quantity: 0 }` on an iceberg or reserve carrying
-  hidden depth, expecting the order to go away, now receives
-  `OrderBookError::ZeroVisibleTranche` and the original is left resting.
-  Call `cancel_order` instead. That update never cancelled anything before
-  this change either — it rested a zero-visible ghost, which then lost its
-  hidden tranche to the first taker that reached the level — so the
-  rejection replaces a silent misbehaviour, not a working idiom. A journal
-  recorded before this change that contains such an `AddOrder` or update
-  fails on replay
-  with `ReplayError::OrderBookError`; snapshot restoration does not run
-  `validate_order_shape`, so a legacy snapshot may still hold such an order,
-  which must be cancelled and re-submitted with a positive visible tranche.
+  Compatibility: admission is strictly tighter, and on the modify paths the
+  rule reaches `Replace` and `UpdatePriceAndQuantity` only. The case to
+  check for is a **soft cancel** through one of those two: an integrator
+  that sent `Replace { quantity: 0 }` or
+  `UpdatePriceAndQuantity { .., new_quantity: 0 }` on a reserve carrying
+  hidden depth and no automatic replenishment, expecting the order to go
+  away, now receives `OrderBookError::ZeroVisibleTranche` and the original
+  is left resting. Neither variant ever cancelled anything: the re-add
+  rested a zero-visible ghost, which then lost its hidden tranche to the
+  first taker that reached the level — so the rejection replaces a silent
+  misbehaviour, not a working idiom. Call `cancel_order` instead. On an
+  iceberg or an auto-replenishing reserve the same two variants are **not**
+  rejected: they re-add with a zero visible tranche and live hidden depth,
+  and the order keeps executing.
+
+  `UpdateQuantity { new_quantity: 0 }` is outside this rule. It is a
+  removal taken before the validator runs, so it cancels the whole order —
+  hidden depth included — on every order kind (#223, below). An integrator
+  who reaches for that variant now gets the removal they asked for; it is
+  the supported soft cancel.
+
+  A journal recorded before this change that contains such an `AddOrder`,
+  or a `Replace` / `UpdatePriceAndQuantity` projecting that shape, fails on
+  replay with `ReplayError::OrderBookError`. Snapshot restoration does not
+  run `validate_order_shape`, but its prepare phase rejects the same shape
+  before touching any book state, so a legacy snapshot holding one fails
+  atomically with `ZeroVisibleTranche` and the live book is left as it was;
+  such an order must be cancelled at the source and re-submitted with a
+  positive visible tranche.
 
 - **Reserve orders are lot-size validated per tranche and on their
   replenishment transfer (#226).** On a book with a lot size,
@@ -483,9 +504,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through validate-first, so an iceberg or auto-replenishing reserve rests
   with a zero visible tranche and its hidden depth live, while a
   non-replenishing reserve is rejected with `ZeroVisibleTranche` and keeps
-  resting (#230). Pinned for plain, iceberg and
-  reserve makers, a `min_order_size` book, a shared level, an absent id and
-  an engaged kill switch.
+  resting (#230); and on a single-tranche maker a zero quantity on either
+  of those two variants ends the order as a terminal
+  `Filled { filled_quantity: 0 }` — it vanishes with a fill status and no
+  fill, which this release pins but does not change.
+
+  Compatibility: this is a behaviour change on a call that previously
+  succeeded, so a journal recorded before it that contains a zero
+  `UpdateQuantity` replays to the new outcome — the order is removed where
+  it previously replayed to a resting zero-quantity maker. The replayed
+  book therefore legitimately differs from the one the original run
+  produced, and `ReplayEngine::verify` against a snapshot taken before this
+  change may return `Ok(false)`. Nothing fails on replay: the update itself
+  is still accepted. No snapshot or journal format change, and
+  `ORDERBOOK_SNAPSHOT_FORMAT_VERSION` is unchanged.
+
+  Pinned for plain, iceberg and reserve makers, a `min_order_size` book, a
+  risk-limited book, a shared level, an absent id and an engaged kill
+  switch, plus the level-change event, the per-account risk release, the
+  strandable-maker count and the contrast against the two cancel-then-add
+  variants.
 
 - **Reserve `UpdatePriceAndQuantity` honours the requested visible quantity
   (#221).** `OrderQuantity::set_quantity` read a `ReserveOrder`'s argument
